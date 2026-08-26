@@ -547,7 +547,7 @@ If you extend this crate, keep the lints on. They pay for themselves.
 
 ## Verification
 
-20 unit tests plus 203 ad-hoc checks across seven harnesses, run against fake in-process SSE servers
+20 unit tests plus 219 ad-hoc checks across eight harnesses, run against fake in-process SSE servers
 (no tokens spent):
 
 - **OpenAI path (32):** full 3-round × 3-member run, request accounting, round-1
@@ -557,6 +557,11 @@ If you extend this crate, keep the lints on. They pay for themselves.
 - **Anthropic path (19):** wire shape, custom auth headers, `${ENV}` expansion,
   `thinking_delta` exclusion, the zero-text failure mode, truncation detection,
   partial-panel degradation.
+- **Concurrency (16):** four identical runs launched simultaneously against one
+  cache key, with injected provider latency to widen the interleaving window —
+  no cross-paired provenance, no garbled JSON, no duplicated consensus. This
+  settles a disagreement a panel left open (two members thought the race was
+  real, one thought it too narrow; nobody had tested it).
 - **URL policy & egress log (24):** local/private addresses reachable, query
   strings permitted and preserved verbatim, fragments and credentials and
   non-http schemes refused before any socket opens, a redirect to a blocked
