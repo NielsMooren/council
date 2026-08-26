@@ -10,6 +10,7 @@ python3.11+ verify/openai_path.py        # 32 checks
 python3.11+ verify/anthropic_path.py     # 19 checks
 python3.11+ verify/runtime_selection.py  # 33 checks
 python3.11+ verify/research_tools.py     # 27 checks
+python3.11+ verify/web_politeness.py     # 18 checks
 ```
 
 Override the binary with `COUNCIL_BIN=/path/to/council`.
@@ -36,3 +37,7 @@ Requires Python 3.11+ (`tomllib`).
 agentic loop is exercised end to end: both wire formats, fragmented tool
 arguments, sandbox escape attempts, tool errors, loop bounding, and the
 research audit trail.
+
+`web_politeness.py` measures rather than assumes: a local server records request
+arrival timestamps, so per-host spacing, shared-across-members throttling, and
+budget enforcement are checked against the clock.

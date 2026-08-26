@@ -153,6 +153,13 @@ impl Deliberation {
                 // Successful streamed calls return in well under this. A request
                 // still open at 10 min is wedged, not slow.
                 .timeout(std::time::Duration::from_secs(600))
+                // Advertise compression so fetched pages are not sent
+                // uncompressed. Costs the server nothing and saves bandwidth.
+                // NOTE: the feature flag alone does nothing - reqwest requires
+                // the builder call too, and silently sends no Accept-Encoding
+                // without it.
+                .gzip(true)
+                .brotli(true)
                 .build()?,
         );
 

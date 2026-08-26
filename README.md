@@ -130,6 +130,50 @@ Four read-only tools, offered only when you enable them:
 rejected before touching disk if absolute or containing `..`, then
 canonicalised and re-checked so a symlink pointing outward is caught too.
 
+#### How a website sees council
+
+Captured off the wire against `httpbin.org`, not inferred from the code:
+
+```
+GET /anything HTTP/1.1
+Host: httpbin.org
+User-Agent: council/0.1 (+https://github.com/NielsMooren/council)
+Accept: */*
+Accept-Encoding: gzip,br
+```
+
+No cookies, no `Accept-Language`, no `Referer`. The UA is honest and
+attributable — it names the software, versions it, and links a real project,
+following the `Googlebot/2.1 (+http://...)` convention. **Never** spoof a
+browser or another crawler's identity.
+
+Stack: `reqwest` 0.12 over `hyper` 1.x and `rustls` 0.23 (not OpenSSL), HTTP/1.1,
+30s per-fetch timeout, up to 10 redirects.
+
+#### Politeness limits
+
+Fetching is throttled **per origin**, shared across every panellist in the run —
+four members researching concurrently cannot each open their own quota on one
+server:
+
+```bash
+council ask "..." --web --host-delay-ms 1000 --host-budget 20   # defaults
+```
+
+- `--host-delay-ms` (default 1000): minimum gap between requests to the *same*
+  host. Requests **wait**; the model still gets its answer, just not instantly.
+- `--host-budget` (default 20): hard cap per host per deliberation. Exceeding it
+  is an **error** returned to the model — a panellist making 20 requests to one
+  host has stopped researching and started crawling.
+
+Different hosts do not block each other. Over MCP the defaults are fixed: a
+program caller does not get to dial politeness down.
+
+Still absent, and deliberately so: no `robots.txt` handling, no caching, no
+conditional GET. Those are crawler concerns, and `fetch_url` is a one-shot
+user-directed fetch. **Do not build recursive or bulk crawling on this** without
+adding them first.
+
 Every lookup is recorded in the transcript, so you can audit what a claim was
 actually based on:
 
@@ -330,7 +374,7 @@ If you extend this crate, keep the lints on. They pay for themselves.
 
 ## Verification
 
-111 ad-hoc checks across four harnesses, run against fake in-process SSE servers
+129 ad-hoc checks across five harnesses, run against fake in-process SSE servers
 (no tokens spent):
 
 - **OpenAI path (32):** full 3-round × 3-member run, request accounting, round-1
@@ -345,6 +389,10 @@ If you extend this crate, keep the lints on. They pay for themselves.
   sandbox escapes refused (absolute paths, `..`, nested traversal), tool errors
   handed back to the model rather than aborting, the loop being bounded, the
   audit trail, and cache-key separation for tool-enabled runs.
+- **Web politeness (18):** `Accept-Encoding` actually on the wire, per-host
+  spacing *measured* from arrival timestamps, spacing shared across concurrent
+  members, different hosts not serialised, the budget as a hard stop with an
+  explanatory refusal, and limits reported to the operator.
 - **Runtime selection (33):** registry discovery, `--with` running exactly the
   chosen models, round count driving call count, chair selection, aliases, the
   `provider:model` escape hatch, rejection of unknown handles / bad chairs /

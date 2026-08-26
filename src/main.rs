@@ -58,6 +58,12 @@ enum Cmd {
         /// Let panellists fetch URLs (specs, docs, upstream source).
         #[arg(long)]
         web: bool,
+        /// Minimum milliseconds between requests to the SAME host.
+        #[arg(long, default_value_t = 1000)]
+        host_delay_ms: u64,
+        /// Max requests to a single host per deliberation.
+        #[arg(long, default_value_t = 20)]
+        host_budget: u32,
         /// Named panel from config. Ignored when --with is given.
         #[arg(short, long)]
         panel: Option<String>,
@@ -102,6 +108,8 @@ async fn main() -> Result<()> {
             max_tokens,
             code,
             web,
+            host_delay_ms,
+            host_budget,
             panel,
             rounds,
             transcript,
@@ -115,6 +123,8 @@ async fn main() -> Result<()> {
                 max_tokens,
                 code,
                 web,
+                host_delay_ms,
+                host_budget,
                 panel,
                 rounds,
                 transcript,
@@ -161,6 +171,8 @@ struct AskOpts {
     max_tokens: Option<u32>,
     code: Vec<PathBuf>,
     web: bool,
+    host_delay_ms: u64,
+    host_budget: u32,
     panel: Option<String>,
     rounds: u8,
     transcript: bool,
@@ -186,17 +198,26 @@ async fn ask(config: Option<&std::path::Path>, o: AskOpts) -> Result<()> {
         other => other.map(str::to_owned),
     };
 
-    let tools = council_tools(&o.code, o.web)?;
+    let tools = council_tools(&o.code, o.web, o.host_delay_ms, o.host_budget)?;
     if !tools.is_empty() {
         eprintln!(
-            "council: tools enabled — roots: [{}], web: {}",
+            "council: tools enabled — roots: [{}], web: {}{}",
             tools
                 .roots
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
-            tools.web
+            tools.web,
+            if tools.web {
+                format!(
+                    " (max {} req/host, {}ms apart)",
+                    tools.rate.max_per_host,
+                    tools.rate.min_interval.as_millis()
+                )
+            } else {
+                String::new()
+            }
         );
     }
 
@@ -239,7 +260,12 @@ async fn ask(config: Option<&std::path::Path>, o: AskOpts) -> Result<()> {
 }
 
 /// Build a toolbox, failing fast on a root that does not exist.
-fn council_tools(code: &[PathBuf], web: bool) -> Result<tools::Toolbox> {
+fn council_tools(
+    code: &[PathBuf],
+    web: bool,
+    host_delay_ms: u64,
+    host_budget: u32,
+) -> Result<tools::Toolbox> {
     let mut roots = Vec::with_capacity(code.len());
     for dir in code {
         let real = dir
@@ -254,6 +280,7 @@ fn council_tools(code: &[PathBuf], web: bool) -> Result<tools::Toolbox> {
         roots,
         web,
         max_bytes: tools::Toolbox::DEFAULT_MAX_BYTES,
+        rate: tools::RateLimit::new(std::time::Duration::from_millis(host_delay_ms), host_budget),
     })
 }
 

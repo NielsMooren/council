@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 rmcp = { version = "3.1.4", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "fs", "time", "sync"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

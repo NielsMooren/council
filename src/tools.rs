@@ -11,8 +11,108 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+/// Per-origin politeness limiter.
+///
+/// Enforces a minimum gap between requests to the *same* host and a hard cap on
+/// total requests to it per deliberation. Per-origin rather than global, because
+/// a global limit both over-throttles a panellist reading two unrelated docs and
+/// under-protects a single host being hammered.
+///
+/// Shared across panellists via `Arc`, so four members researching concurrently
+/// cannot each open their own quota on one poor server.
+#[derive(Debug, Clone)]
+pub struct RateLimit {
+    /// Minimum spacing between requests to one host.
+    pub min_interval: Duration,
+    /// Max requests to a single host per deliberation.
+    pub max_per_host: u32,
+    state: Arc<Mutex<HashMap<String, HostState>>>,
+}
+
+#[derive(Debug)]
+struct HostState {
+    last: Option<Instant>,
+    count: u32,
+}
+
+impl Default for RateLimit {
+    fn default() -> Self {
+        Self {
+            // 1 req/s to a host is the conventional crawl-delay floor and well
+            // inside what any server tolerates.
+            min_interval: Duration::from_millis(1000),
+            max_per_host: 20,
+            state: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl RateLimit {
+    /// Build a limiter with explicit limits.
+    pub fn new(min_interval: Duration, max_per_host: u32) -> Self {
+        Self {
+            min_interval,
+            max_per_host,
+            state: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Wait until it is polite to call `host`, or refuse if the budget is spent.
+    ///
+    /// Sleeping (rather than erroring) on the interval is deliberate: the model
+    /// asked a reasonable question and should get an answer, just not instantly.
+    /// The *budget* is a hard error because a panellist making 20 requests to one
+    /// host has stopped researching and started crawling.
+    async fn acquire(&self, host: &str) -> Result<()> {
+        // The guard must cover the whole read-modify-write, or two concurrent
+        // panellists both see the same `last` and fire simultaneously. It is
+        // dropped explicitly before sleeping so nobody waits on the lock while
+        // we wait on the clock.
+        let mut map = self.state.lock().await;
+        let entry = map.entry(host.to_owned()).or_insert(HostState {
+            last: None,
+            count: 0,
+        });
+        if entry.count >= self.max_per_host {
+            bail!(
+                "rate limit: already made {} requests to {host} in this deliberation; \
+                 refusing more. Use what you have or cite it as unverifiable.",
+                entry.count
+            );
+        }
+        entry.count = entry.count.saturating_add(1);
+
+        // Chain each slot off the PREVIOUS reservation, not off "now".
+        //
+        // The naive version (`wait = min_interval - (now - last)`, then
+        // `last = now`) lets two concurrent callers both compute wait=0 and fire
+        // together - measured as gaps of [303, 4, 297, 6] ms with two members.
+        // Reserving `prev + min_interval` makes the slots strictly sequential
+        // however many panellists race for them.
+        let now = Instant::now();
+        let slot = entry.last.map_or(now, |prev| {
+            let next = prev
+                .checked_add(self.min_interval)
+                .unwrap_or_else(Instant::now);
+            if next > now { next } else { now }
+        });
+        entry.last = Some(slot);
+        let wait = slot.checked_duration_since(now);
+        drop(map);
+
+        if let Some(d) = wait {
+            tokio::time::sleep(d).await;
+        }
+        Ok(())
+    }
+}
 
 /// What a deliberation is allowed to look at.
 #[derive(Debug, Clone, Default)]
@@ -24,6 +124,8 @@ pub struct Toolbox {
     /// Max bytes returned from any single read, so one huge file cannot blow the
     /// context window of every subsequent round.
     pub max_bytes: usize,
+    /// Per-origin politeness limiter, shared by every panellist in the run.
+    pub rate: RateLimit,
 }
 
 impl Toolbox {
@@ -259,6 +361,9 @@ impl Toolbox {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             bail!("only http(s) URLs are allowed");
         }
+        // Throttle per host before the request, not after: the point is to not
+        // hit the server too fast, so the wait has to happen first.
+        self.rate.acquire(&host_of(url)).await?;
         let resp = http
             .get(url)
             .header(
@@ -280,6 +385,21 @@ impl Toolbox {
         }
         Ok(text)
     }
+}
+
+/// Host portion of a URL, for rate-limit bookkeeping.
+///
+/// Deliberately string-based rather than pulling in a URL parser: we only need a
+/// stable bucket key, and a malformed URL will fail at the request anyway.
+fn host_of(url: &str) -> String {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Strip credentials and port so the bucket is per-host, not per-URL.
+    let host = host.rsplit('@').next().unwrap_or(host);
+    host.split(':').next().unwrap_or(host).to_ascii_lowercase()
 }
 
 /// Crude tag stripper. Good enough for docs and specs; we are feeding a language

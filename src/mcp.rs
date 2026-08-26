@@ -124,6 +124,9 @@ for factual lookups or tasks with a single correct answer."
             roots,
             web: args.web.unwrap_or(false),
             max_bytes: crate::tools::Toolbox::DEFAULT_MAX_BYTES,
+            // Defaults only: an MCP caller is a program, and letting it dial
+            // politeness limits down is exactly how a service becomes abusive.
+            rate: crate::tools::RateLimit::default(),
         };
 
         let d = Deliberation {
