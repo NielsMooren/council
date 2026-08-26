@@ -172,9 +172,12 @@ friends. See `[lints.clippy]` in `Cargo.toml`.
 prototyping stays fast where a panic is just a failed assertion.
 
 ```bash
-cargo clippy --all-targets   # zero errors, zero warnings
+cargo clippy --all-targets   # zero errors, zero warnings, zero suppressions
 cargo fmt --check
 ```
+
+There is not a single `#[allow(clippy::…)]` or `#[expect(clippy::…)]` in `src/`.
+Every one of the 44 initial violations was fixed rather than silenced.
 
 Adopting this standard was not cosmetic — it found three reachable panics in the
 first pass:
