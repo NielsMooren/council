@@ -1,0 +1,6 @@
+# Prototype freely with unwrap/expect/panic in tests - clippy ignores them there.
+# Per https://www.namtao.com/rust/
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

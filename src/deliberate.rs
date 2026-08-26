@@ -13,6 +13,7 @@ use crate::provider::Request;
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -109,7 +110,7 @@ impl Deliberation {
             h.update(m.name.as_bytes());
             h.update(m.model.as_bytes());
         }
-        format!("{:x}", h.finalize())[..16].to_string()
+        format!("{:x}", h.finalize()).chars().take(16).collect()
     }
 
     pub async fn run(&self, cfg: &Config) -> Result<Outcome> {
@@ -125,87 +126,31 @@ impl Deliberation {
         let dir = cfg.data_dir().join("runs").join(self.cache_key(panel));
         tokio::fs::create_dir_all(&dir).await.ok();
 
-        let system_base = match &self.context {
-            Some(c) => format!(
-                "{RULES}\n\n=== QUESTION ===\n{}\n\n=== CONTEXT ===\n{c}",
-                self.question
-            ),
-            None => format!("{RULES}\n\n=== QUESTION ===\n{}", self.question),
-        };
+        let question = &self.question;
+        let system_base = self.context.as_ref().map_or_else(
+            || format!("{RULES}\n\n=== QUESTION ===\n{question}"),
+            |c| format!("{RULES}\n\n=== QUESTION ===\n{question}\n\n=== CONTEXT ===\n{c}"),
+        );
 
         let mut transcript = String::new();
         let mut failures = Vec::new();
 
         for round in 1..=self.rounds {
-            let prompt = Arc::new(round_prompt(round, self.rounds, &transcript));
-            let mut tasks = FuturesUnordered::new();
-
-            for member in &panel.members {
-                let (http, prompt, dir) = (http.clone(), prompt.clone(), dir.clone());
-                let provider = cfg.provider(&member.provider)?.clone();
-                let member = member.clone();
-                let max_tokens = member.max_tokens.unwrap_or(cfg.max_tokens);
-                let system = match &member.persona {
-                    Some(p) => format!("{system_base}\n\n=== YOUR PERSPECTIVE ===\n{p}"),
-                    None => system_base.clone(),
-                };
-
-                tasks.push(async move {
-                    let path = dir.join(format!("r{round}_{}.md", member.name));
-                    // Resume: a killed run must not re-pay for finished work.
-                    if let Ok(cached) = tokio::fs::read_to_string(&path).await {
-                        if cached.len() > 200 {
-                            return (member.name, Ok(cached));
-                        }
-                    }
-                    let out = provider
-                        .complete(
-                            &http,
-                            Request {
-                                model: &member.model,
-                                system: &system,
-                                user: &prompt,
-                                max_tokens,
-                            },
-                        )
-                        .await;
-                    if let Ok(text) = &out {
-                        let _ = tokio::fs::write(&path, text).await;
-                    }
-                    (member.name, out)
-                });
-            }
-
-            let mut round_out: Vec<(String, String)> = Vec::new();
-            while let Some((name, res)) = tasks.next().await {
-                match res {
-                    Ok(text) => round_out.push((name, text)),
-                    Err(e) => {
-                        // One dead model must not kill the panel; note it and go on.
-                        tracing::warn!("{name} failed in round {round}: {e:#}");
-                        failures.push(format!("{name} (round {round}): {e}"));
-                    }
-                }
-            }
-            if round_out.is_empty() {
-                anyhow::bail!(
-                    "every member failed in round {round}; first error: {}",
-                    failures.first().map(String::as_str).unwrap_or("unknown")
-                );
-            }
-            // Stable order regardless of completion order, so the transcript is
-            // reproducible and diffable across runs.
-            round_out.sort_by_key(|(n, _)| {
-                panel
-                    .members
-                    .iter()
-                    .position(|m| &m.name == n)
-                    .unwrap_or(usize::MAX)
-            });
-
-            transcript.push_str(&format!("\n########## ROUND {round} ##########\n"));
+            let round_out = self
+                .run_round(
+                    cfg,
+                    panel,
+                    &http,
+                    &dir,
+                    &system_base,
+                    round,
+                    &transcript,
+                    &mut failures,
+                )
+                .await?;
+            let _ = writeln!(transcript, "\n########## ROUND {round} ##########");
             for (name, text) in &round_out {
-                transcript.push_str(&format!("\n===== {name} =====\n{text}\n"));
+                let _ = writeln!(transcript, "\n===== {name} =====\n{text}");
             }
         }
 
@@ -254,5 +199,89 @@ impl Deliberation {
             cache_dir: dir,
             failures,
         })
+    }
+
+    /// One round: every member in parallel, cached, failures collected.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal helper, all fields needed"
+    )]
+    async fn run_round(
+        &self,
+        cfg: &Config,
+        panel: &Panel,
+        http: &Arc<reqwest::Client>,
+        dir: &std::path::Path,
+        system_base: &str,
+        round: u8,
+        transcript: &str,
+        failures: &mut Vec<String>,
+    ) -> Result<Vec<(String, String)>> {
+        let prompt = Arc::new(round_prompt(round, self.rounds, transcript));
+        let mut tasks = FuturesUnordered::new();
+
+        for member in &panel.members {
+            let (http, prompt, dir) = (http.clone(), prompt.clone(), dir.to_path_buf());
+            let provider = cfg.provider(&member.provider)?.clone();
+            let member = member.clone();
+            let max_tokens = member.max_tokens.unwrap_or(cfg.max_tokens);
+            let system = member.persona.as_ref().map_or_else(
+                || system_base.to_owned(),
+                |p| format!("{system_base}\n\n=== YOUR PERSPECTIVE ===\n{p}"),
+            );
+
+            tasks.push(async move {
+                let path = dir.join(format!("r{round}_{}.md", member.name));
+                // Resume: a killed run must not re-pay for finished work.
+                if let Ok(cached) = tokio::fs::read_to_string(&path).await {
+                    if cached.len() > 200 {
+                        return (member.name, Ok(cached));
+                    }
+                }
+                let out = provider
+                    .complete(
+                        &http,
+                        Request {
+                            model: &member.model,
+                            system: &system,
+                            user: &prompt,
+                            max_tokens,
+                        },
+                    )
+                    .await;
+                if let Ok(text) = &out {
+                    let _ = tokio::fs::write(&path, text).await;
+                }
+                (member.name, out)
+            });
+        }
+
+        let mut round_out: Vec<(String, String)> = Vec::new();
+        while let Some((name, res)) = tasks.next().await {
+            match res {
+                Ok(text) => round_out.push((name, text)),
+                Err(e) => {
+                    // One dead model must not kill the panel; note it and go on.
+                    tracing::warn!("{name} failed in round {round}: {e:#}");
+                    failures.push(format!("{name} (round {round}): {e}"));
+                }
+            }
+        }
+        if round_out.is_empty() {
+            anyhow::bail!(
+                "every member failed in round {round}; first error: {}",
+                failures.first().map_or("unknown", String::as_str)
+            );
+        }
+        // Stable order regardless of completion order, so the transcript is
+        // reproducible and diffable across runs.
+        round_out.sort_by_key(|(n, _)| {
+            panel
+                .members
+                .iter()
+                .position(|m| &m.name == n)
+                .unwrap_or(usize::MAX)
+        });
+        Ok(round_out)
     }
 }

@@ -33,3 +33,26 @@ clap = { version = "4", features = ["derive"] }
 [profile.release]
 lto = "thin"
 strip = true
+
+# Strict lints per https://www.namtao.com/rust/
+# Two purposes: teach the language, and stop panics at runtime.
+# Prototyping with .unwrap() is fine *in tests* - see clippy.toml.
+[lints.clippy]
+# UM, ACTUALLY
+pedantic = { level = "deny", priority = -1 }
+# DEVELOPING LINTS
+nursery = { level = "deny", priority = -1 }
+# DENY PANICS
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+unchecked_time_subtraction = "deny"
+todo = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+panic = "deny"
+exit = "deny"
+as_conversions = "deny"

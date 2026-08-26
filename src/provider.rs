@@ -8,11 +8,11 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol. Not the vendor — a vendor may speak several, and gateways
-/// (LiteLLM, OpenRouter, corporate proxies) usually speak one of these two.
+/// (`LiteLLM`, `OpenRouter`, corporate proxies) usually speak one of these two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Api {
-    /// POST /chat/completions — OpenAI, Azure, OpenRouter, Groq, vLLM, Ollama…
+    /// POST /chat/completions — `OpenAI`, Azure, `OpenRouter`, Groq, vLLM, Ollama…
     OpenaiChat,
     /// POST /v1/messages — Anthropic and Anthropic-compatible gateways.
     AnthropicMessages,
@@ -26,7 +26,7 @@ pub enum Auth {
     Bearer,
     /// `x-api-key: <key>` — Anthropic direct.
     XApiKey,
-    /// `api-key: <key>` — Azure OpenAI and several corporate gateways.
+    /// `api-key: <key>` — Azure `OpenAI` and several corporate gateways.
     ApiKey,
     /// Arbitrary header name, for gateways that invent their own.
     Header(String),
@@ -56,10 +56,10 @@ pub struct Provider {
     pub disable_thinking: bool,
 }
 
-fn default_auth() -> Auth {
+const fn default_auth() -> Auth {
     Auth::Bearer
 }
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -93,16 +93,25 @@ impl Provider {
 
     /// Expand `${VAR}` in header values so `anthropic-version` style statics and
     /// env-backed secrets can live side by side.
-    fn expand(&self, v: &str) -> String {
-        let mut out = v.to_string();
-        while let Some(s) = out.find("${") {
-            let Some(e) = out[s..].find('}').map(|i| s + i) else {
-                break;
+    fn expand(v: &str) -> String {
+        // Split on the delimiters rather than byte-slicing: `${` / `}` are ASCII
+        // but the surrounding value need not be, and str slicing panics on a
+        // non-char-boundary index.
+        let mut out = String::with_capacity(v.len());
+        let mut rest = v;
+        while let Some((before, after)) = rest.split_once("${") {
+            let Some((var, tail)) = after.split_once('}') else {
+                // Unterminated `${` - emit the remainder verbatim.
+                out.push_str(before);
+                out.push_str("${");
+                out.push_str(after);
+                return out;
             };
-            let var = &out[s + 2..e];
-            let val = std::env::var(var).unwrap_or_default();
-            out.replace_range(s..=e, &val);
+            out.push_str(before);
+            out.push_str(&std::env::var(var).unwrap_or_default());
+            rest = tail;
         }
+        out.push_str(rest);
         out
     }
 
@@ -137,7 +146,10 @@ impl Provider {
                     "messages": [{"role": "user", "content": r.user}],
                 });
                 if self.disable_thinking {
-                    b["thinking"] = json!({"type": "disabled"});
+                    // Insert via the map: `b["k"] = v` panics if `b` is not an object.
+                    if let Some(map) = b.as_object_mut() {
+                        map.insert("thinking".into(), json!({"type": "disabled"}));
+                    }
                 }
                 b
             }
@@ -164,7 +176,7 @@ impl Provider {
             Auth::Header(h) => req.header(h.as_str(), key),
         };
         for (k, v) in &self.headers {
-            req = req.header(k.as_str(), self.expand(v));
+            req = req.header(k.as_str(), Self::expand(v));
         }
 
         let resp = req.send().await.context("request failed")?;
@@ -177,16 +189,26 @@ impl Provider {
             );
         }
 
+        let (text, stop) = self.read_stream(resp).await?;
+        Self::check(&text, stop.as_deref())
+    }
+
+    /// Consume the SSE body into `(text, stop_reason)`.
+    async fn read_stream(&self, resp: reqwest::Response) -> Result<(String, Option<String>)> {
         let mut stream = resp.bytes_stream();
-        let (mut buf, mut text, mut stop) = (String::new(), String::new(), None);
+        // Buffer BYTES, not a String. Decoding each chunk with from_utf8_lossy
+        // would corrupt any multi-byte character split across a chunk boundary,
+        // and byte-slicing a String panics on a non-char boundary. Split on the
+        // newline byte, then decode whole lines.
+        let (mut buf, mut text, mut stop) = (Vec::<u8>::new(), String::new(), None);
 
         while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk.context("stream error")?));
-            // SSE frames are newline-delimited; keep the partial tail.
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].trim().to_string();
-                buf.drain(..=nl);
-                let Some(payload) = line.strip_prefix("data:") else {
+            buf.extend_from_slice(&chunk.context("stream error")?);
+            // SSE frames are newline-delimited; keep the partial tail in `buf`.
+            while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&line);
+                let Some(payload) = line.trim().strip_prefix("data:") else {
                     continue;
                 };
                 let payload = payload.trim();
@@ -197,38 +219,66 @@ impl Provider {
                 let Ok(ev) = serde_json::from_str::<serde_json::Value>(payload) else {
                     continue;
                 };
+                // `.get()` throughout rather than `[]`: Value indexing panics on
+                // a type mismatch, and a stray frame shape must never abort a run.
                 match self.api {
                     Api::OpenaiChat => {
-                        if let Some(c) = ev["choices"].get(0) {
-                            if let Some(s) = c["delta"]["content"].as_str() {
-                                text.push_str(s);
-                            }
-                            if let Some(fr) = c["finish_reason"].as_str() {
-                                stop = Some(fr.to_string());
-                            }
+                        let Some(choice) = ev.get("choices").and_then(|c| c.get(0)) else {
+                            continue;
+                        };
+                        if let Some(s) = choice
+                            .get("delta")
+                            .and_then(|d| d.get("content"))
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            text.push_str(s);
+                        }
+                        if let Some(fr) = choice
+                            .get("finish_reason")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            stop = Some(fr.to_owned());
                         }
                     }
-                    Api::AnthropicMessages => match ev["type"].as_str() {
-                        // Only `text_delta` — `thinking_delta` is not an answer.
-                        Some("content_block_delta") => {
-                            if ev["delta"]["type"] == "text_delta" {
-                                if let Some(s) = ev["delta"]["text"].as_str() {
-                                    text.push_str(s);
+                    Api::AnthropicMessages => {
+                        let delta = ev.get("delta");
+                        match ev.get("type").and_then(serde_json::Value::as_str) {
+                            // Only `text_delta` — `thinking_delta` is not an answer.
+                            Some("content_block_delta") => {
+                                let is_text = delta
+                                    .and_then(|d| d.get("type"))
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some("text_delta");
+                                if is_text {
+                                    if let Some(s) = delta
+                                        .and_then(|d| d.get("text"))
+                                        .and_then(serde_json::Value::as_str)
+                                    {
+                                        text.push_str(s);
+                                    }
                                 }
                             }
-                        }
-                        Some("message_delta") => {
-                            if let Some(sr) = ev["delta"]["stop_reason"].as_str() {
-                                stop = Some(sr.to_string());
+                            Some("message_delta") => {
+                                if let Some(sr) = delta
+                                    .and_then(|d| d.get("stop_reason"))
+                                    .and_then(serde_json::Value::as_str)
+                                {
+                                    stop = Some(sr.to_owned());
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
-                    },
+                    }
                 }
             }
         }
 
-        let text = text.trim().to_string();
+        Ok((text, stop))
+    }
+
+    /// Reject the two silent-failure shapes: empty output, and truncation.
+    fn check(text: &str, stop: Option<&str>) -> Result<String> {
+        let text = text.trim().to_owned();
         if text.is_empty() {
             bail!(
                 "empty response (stop={stop:?}) — if this is a reasoning model, thinking tokens may have consumed the whole budget; keep disable_thinking = true or raise max_tokens"
@@ -236,7 +286,7 @@ impl Provider {
         }
         // Truncation must be loud. A silently clipped argument poisons every
         // later round, and the panel will confidently reason from half a claim.
-        if matches!(stop.as_deref(), Some("length") | Some("max_tokens")) {
+        if matches!(stop, Some("length" | "max_tokens")) {
             bail!(
                 "truncated at {} chars (stop={stop:?}) — raise max_tokens",
                 text.len()

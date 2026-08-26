@@ -159,6 +159,37 @@ signal and the caller is told so explicitly.
 **`max_completion_tokens` vs `max_tokens`** is selected per wire format; newer
 OpenAI reasoning models hard-reject the latter with a 400.
 
+## Code standards
+
+This crate follows the strict-lint standard from
+[namtao.com/rust](https://www.namtao.com/rust/): `clippy::pedantic` and
+`clippy::nursery` at `deny`, plus an explicit deny-list for everything that can
+panic at runtime — `unwrap_used`, `expect_used`, `indexing_slicing`,
+`arithmetic_side_effects`, `panic`, `exit`, `as_conversions`, `string_slice` and
+friends. See `[lints.clippy]` in `Cargo.toml`.
+
+`clippy.toml` re-permits `unwrap`/`expect`/`panic`/indexing **in tests only**, so
+prototyping stays fast where a panic is just a failed assertion.
+
+```bash
+cargo clippy --all-targets   # zero errors, zero warnings
+cargo fmt --check
+```
+
+Adopting this standard was not cosmetic — it found three reachable panics in the
+first pass:
+
+- `Value["key"]` indexing in the SSE parser, which panics on an unexpected frame
+  shape from a provider. Now `.get()` throughout.
+- `buf[..nl]` byte-slicing a `String` of streamed data, which panics if a
+  multi-byte UTF-8 character straddles the slice index. The buffer is now
+  `Vec<u8>`, split on the newline byte and decoded per whole line — which also
+  fixed a latent corruption bug, since `from_utf8_lossy` per chunk mangles any
+  character split across a chunk boundary.
+- `format!("{:x}", hash)[..16]` in the cache key, same class of bug.
+
+If you extend this crate, keep the lints on. They pay for themselves.
+
 ## Verification
 
 51 ad-hoc checks across two harnesses, run against fake in-process SSE servers

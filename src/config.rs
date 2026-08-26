@@ -28,7 +28,7 @@ pub struct Config {
     pub max_tokens: u32,
 }
 
-fn default_max_tokens() -> u32 {
+const fn default_max_tokens() -> u32 {
     12_000
 }
 
@@ -40,9 +40,7 @@ impl Config {
     }
 
     pub fn load(path: Option<&Path>) -> Result<Self> {
-        let path = path
-            .map(Path::to_path_buf)
-            .unwrap_or_else(Self::default_path);
+        let path = path.map_or_else(Self::default_path, Path::to_path_buf);
         if !path.exists() {
             bail!(
                 "no config at {}\n\nRun `council init` to write a starter config.",
@@ -129,7 +127,7 @@ impl Config {
 
 /// Starter config. Deliberately shows three different wire/auth combinations,
 /// because getting a corporate gateway working is the usual first hurdle.
-pub const STARTER: &str = r##"# council config. Secrets stay in env vars - never inline them here.
+pub const STARTER: &str = r#"# council config. Secrets stay in env vars - never inline them here.
 max_tokens = 12000
 
 # --- OpenAI (or any OpenAI-compatible gateway: OpenRouter, Groq, vLLM, Ollama) ---
@@ -185,4 +183,4 @@ chair = "Chair"
   provider = "anthropic"
   model = "claude-opus-4-5"
   persona = "You weigh trade-offs and refuse to manufacture agreement."
-"##;
+"#;
