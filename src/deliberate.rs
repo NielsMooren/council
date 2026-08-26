@@ -160,6 +160,10 @@ impl Deliberation {
                 // without it.
                 .gzip(true)
                 .brotli(true)
+                // Redirects are followed MANUALLY in tools.rs so the rate
+                // limiter can charge every hop. Automatic following would make
+                // hops 2..10 invisible to it.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
         );
 

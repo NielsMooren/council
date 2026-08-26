@@ -5,12 +5,13 @@ Ad-hoc end-to-end verification. **Not** a unit-test suite — these drive the re
 are spent and no network access is needed.
 
 ```bash
+cargo test              # 9 unit tests (pure logic, paused clock, no sockets)
 cargo build
 python3.11+ verify/openai_path.py        # 32 checks
 python3.11+ verify/anthropic_path.py     # 19 checks
 python3.11+ verify/runtime_selection.py  # 33 checks
 python3.11+ verify/research_tools.py     # 27 checks
-python3.11+ verify/web_politeness.py     # 30 checks
+python3.11+ verify/web_politeness.py     # 41 checks
 ```
 
 Override the binary with `COUNCIL_BIN=/path/to/council`.

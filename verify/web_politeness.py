@@ -47,6 +47,32 @@ class Site(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         HITS.append((self.headers.get("host", "?"), time.monotonic()))
         HEADERS.append(dict(self.headers.items()))
+
+        # /slow: never answers in time, to measure failure amplification.
+        if self.path.startswith("/slow"):
+            time.sleep(35)
+            return
+
+        # /hop/N: redirect chain, to check every hop is metered.
+        if self.path.startswith("/hop/"):
+            n = int(self.path.rsplit("/", 1)[-1])
+            self.send_response(302)
+            nxt = f"/hop/{n - 1}" if n > 1 else "/spec"
+            self.send_header("location", nxt)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+
+        # /bomb: a body far larger than the ingest cap.
+        if self.path.startswith("/bomb"):
+            big = b"<p>" + (b"A" * 5_000_000) + b"</p>"
+            self.send_response(200)
+            self.send_header("content-type", "text/html")
+            self.send_header("content-length", str(len(big)))
+            self.end_headers()
+            self.wfile.write(big)
+            return
+
         self.send_response(200)
         self.send_header("content-type", "text/html")
         self.send_header("content-length", str(len(PAGE)))
@@ -162,7 +188,7 @@ def run(urls, *extra, per_model=None, question="Q?"):
 print("1. gzip/brotli advertised")
 r = run([URL], question="Q-gzip")
 check("run succeeds", r.returncode == 0, r.stderr[-300:])
-check("at least one request arrived", len(HEADERS) >= 1, len(HEADERS))
+check("exactly one request arrived", len(HEADERS) == 1, len(HEADERS))
 ae = HEADERS[0].get("accept-encoding", "") if HEADERS else ""
 check("accept-encoding sent", "gzip" in ae, repr(ae))
 check("brotli offered too", "br" in ae, repr(ae))
@@ -181,13 +207,13 @@ r = run([f"http://127.0.0.1:{site_port}/s{i}" for i in range(4)],
 check("run succeeds", r.returncode == 0, r.stderr[-300:])
 times = sorted(t for _, t in HITS)
 gaps = [round((b - a) * 1000) for a, b in zip(times, times[1:])]
-check("multiple requests made", len(times) >= 4, len(times))
+check("exactly 4 requests made", len(times) == 4, len(times))
 # Allow slack for scheduling jitter; the point is that they are NOT bunched.
 check("consecutive requests >= ~300ms apart", all(g >= 240 for g in gaps), gaps)
 # The two members run concurrently and pull from one shared 4-URL script, so
 # every request must still pass through ONE queue: no pair may arrive together.
 check("spacing is shared across members, not per-member",
-      len(gaps) >= 3 and all(g >= 240 for g in gaps), gaps)
+      len(gaps) == 3 and all(g >= 240 for g in gaps), gaps)
 
 print("\n3. spacing is per-HOST, not global")
 # Second server = different host bucket. Requests to different hosts must not
@@ -216,7 +242,7 @@ print("\n4. per-host budget is a hard stop")
 r = run([f"http://127.0.0.1:{site_port}/b{i}" for i in range(8)],
         "--host-delay-ms", "0", "--host-budget", "3", question="Q-budget")
 check("run still succeeds", r.returncode == 0, r.stderr[-300:])
-check("requests capped at the shared budget", len(HITS) <= 3,
+check("requests capped at the shared budget", len(HITS) == 3,
       f"{len(HITS)} hits, budget 3")
 joined = "\n".join(TOOL_OUT)
 check("refusal explained to the model", "rate limit" in joined, joined[-300:])
@@ -235,7 +261,7 @@ r = run([f"http://127.0.0.1:{site_port}/x", f"http://127.0.0.1:{site_port}/y"],
 times = sorted(t for _, t in HITS)
 gaps6 = [round((b - a) * 1000) for a, b in zip(times, times[1:])]
 check("same host, different paths, still throttled",
-      len(gaps6) >= 1 and all(g >= 320 for g in gaps6), gaps6)
+      len(gaps6) == 1 and all(g >= 320 for g in gaps6), gaps6)
 
 print("\n7. URL cache: concurrent members collapse to ONE fetch")
 # Both members fetch the SAME url on their first turn, concurrently.
@@ -246,7 +272,7 @@ r = run(None, "--host-delay-ms", "0", question="Q-singleflight", per_model={
 check("run succeeds", r.returncode == 0, r.stderr[-300:])
 check("two members, ONE upstream request", len(HITS) == 1, f"{len(HITS)} hits")
 joined = "\n".join(TOOL_OUT)
-check("both members still got the page", joined.count("Spec body") >= 2, joined[:200])
+check("both members still got the page", joined.count("Spec body") == 2, joined[:200])
 check("cache hit is disclosed to the model", "from cache" in joined, joined[:300])
 
 print("\n8. cache survives across rounds and members")
@@ -259,8 +285,10 @@ r = run([f"http://127.0.0.1:{site_port}/one", f"http://127.0.0.1:{site_port}/two
 check("two distinct URLs = two requests", len(HITS) == 2, f"{len(HITS)} hits")
 
 print("\n10. ttl=0 disables caching")
+# 2 members x 3 fetches of the same URL = 6 real requests once caching is off.
+# (With the default TTL this would be 1, which sections 7-8 assert.)
 r = run([URL] * 3, "--host-delay-ms", "0", "--cache-ttl", "0", question="Q-nocache")
-check("no caching when ttl is 0", len(HITS) >= 3, f"{len(HITS)} hits")
+check("no caching when ttl is 0", len(HITS) == 6, f"{len(HITS)} hits")
 
 print("\n11. cache hits do not consume the host budget")
 # Budget of 1, but 4 fetches of the same URL: the single real request uses the
@@ -282,6 +310,44 @@ check("errors not served from cache", "from cache" not in joined, joined[:200])
 print("\n13. ttl is reported to the operator")
 r = run([URL], "--cache-ttl", "900", question="Q-ttl-report")
 check("stderr reports the cache ttl", "900s cache" in r.stderr, r.stderr[:300])
+
+print("\n14. every redirect hop is metered (the politeness bypass)")
+# 3 hops then the real page = 4 origins contacted for ONE fetch_url call.
+r = run([f"http://127.0.0.1:{site_port}/hop/3"], "--host-delay-ms", "0",
+        question="Q-redirect")
+check("run succeeds", r.returncode == 0, r.stderr[-300:])
+check("all 4 hops hit the server", len(HITS) == 4, f"{len(HITS)} hits")
+# Budget of 2 must stop a 4-hop chain partway - proving hops are charged.
+r = run([f"http://127.0.0.1:{site_port}/hop/3"], "--host-delay-ms", "0",
+        "--host-budget", "2", question="Q-redirect-budget")
+joined = "\n".join(TOOL_OUT)
+check("budget stops a redirect chain", len(HITS) == 2, f"{len(HITS)} hits, budget 2")
+check("refusal reported to the model", "rate limit" in joined, joined[-200:])
+
+print("\n15. oversized bodies are refused before buffering")
+r = run([f"http://127.0.0.1:{site_port}/bomb"], "--host-delay-ms", "0",
+        question="Q-bomb")
+joined = "\n".join(TOOL_OUT)
+check("run succeeds", r.returncode == 0, r.stderr[-300:])
+check("5MB body rejected on Content-Length",
+      "too large" in joined, joined[:250])
+check("oversized response not cached", "from cache" not in joined, joined[:200])
+
+print("\n16. a hung fetch is coalesced, not multiplied")
+# Both members ask for /slow at once. Single-flight + failure sharing means ONE
+# upstream request, not one per member.
+t0 = time.monotonic()
+r = run(None, "--host-delay-ms", "0", question="Q-slow", per_model={
+    "m-a": [f"http://127.0.0.1:{site_port}/slow"],
+    "m-b": [f"http://127.0.0.1:{site_port}/slow"],
+})
+elapsed = time.monotonic() - t0
+check("run still succeeds", r.returncode == 0, r.stderr[-300:])
+check("two members, ONE upstream attempt", len(HITS) == 1, f"{len(HITS)} hits")
+# Without coalescing this would be ~2x30s. With it, ~30s once.
+check("no N x timeout amplification", elapsed < 50, f"{elapsed:.0f}s elapsed")
+joined = "\n".join(TOOL_OUT)
+check("timeout surfaced to both members", joined.count("error") >= 2, joined[:200])
 
 site.shutdown()
 llm.shutdown()

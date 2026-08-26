@@ -8,15 +8,18 @@
 //! Off by default: a run only gets tools when the caller passes roots (or
 //! enables web search). Silence is the safe default.
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
+use url::Url;
 
 /// Per-origin politeness limiter.
 ///
@@ -136,15 +139,35 @@ type Slot = Arc<Mutex<Option<CachedPage>>>;
 #[derive(Debug, Clone)]
 pub struct UrlCache {
     ttl: Duration,
+    /// Max distinct URLs retained. Nothing else bounds this: a model can name
+    /// unlimited URLs across unlimited hosts, and the per-host request budget
+    /// does not help because each new host gets its own budget.
+    max_entries: usize,
     /// Outer lock is held only briefly, to hand out the per-URL slot.
     slots: Arc<Mutex<HashMap<String, Slot>>>,
 }
 
 #[derive(Debug, Clone)]
 struct CachedPage {
-    body: String,
+    outcome: Outcome,
     fetched_at: Instant,
 }
+
+/// A slot holds either a body or a recent failure.
+///
+/// Failures are recorded for `FAILURE_GRACE` only - long enough that peers
+/// already queued behind a 30s timeout inherit the error instead of each
+/// starting their own 30s attempt, short enough that a transient 503 is retried
+/// rather than remembered for the whole TTL.
+#[derive(Debug, Clone)]
+enum Outcome {
+    Body(String),
+    Failed(String),
+}
+
+/// How long a failure suppresses re-attempts. Covers the queue that built up
+/// during one slow fetch without meaningfully delaying an honest retry.
+const FAILURE_GRACE: Duration = Duration::from_secs(5);
 
 impl Default for UrlCache {
     fn default() -> Self {
@@ -152,10 +175,16 @@ impl Default for UrlCache {
     }
 }
 
+/// Entry ceiling. Generous for a single deliberation, but finite - TTL alone
+/// governs *freshness*, not retention, so without this expired entries stay
+/// resident for the life of the process.
+const DEFAULT_MAX_ENTRIES: usize = 256;
+
 impl UrlCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
+            max_entries: DEFAULT_MAX_ENTRIES,
             slots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -177,6 +206,9 @@ impl UrlCache {
         // Grab (or create) this URL's slot, then release the map so a slow fetch
         // of one URL never blocks lookups of a different URL.
         let mut slots = self.slots.lock().await;
+        if !slots.contains_key(url) {
+            self.evict(&mut slots);
+        }
         let slot = Arc::clone(slots.entry(url.to_owned()).or_default());
         drop(slots);
 
@@ -186,22 +218,95 @@ impl UrlCache {
         // (clippy::significant_drop_tightening wants it dropped earlier; doing
         // so would reintroduce the thundering herd this exists to prevent.)
         let mut entry = slot.lock().await;
-        let fresh = entry.as_ref().and_then(|page| {
-            (Instant::now().saturating_duration_since(page.fetched_at) < self.ttl)
-                .then(|| page.body.clone())
-        });
-        let result = if let Some(body) = fresh {
-            (body, true)
-        } else {
-            let body = fetch().await?;
-            *entry = Some(CachedPage {
-                body: body.clone(),
-                fetched_at: Instant::now(),
-            });
-            (body, false)
+        if let Some(page) = entry.as_ref() {
+            let age = Instant::now().saturating_duration_since(page.fetched_at);
+            match &page.outcome {
+                Outcome::Body(body) if age < self.ttl => {
+                    let body = body.clone();
+                    drop(entry);
+                    return Ok((body, true));
+                }
+                // Inherit a recent failure rather than repeating it. This is the
+                // difference between one 30s timeout and N of them: without it,
+                // each waiter acquires the guard and starts a fresh attempt.
+                // Suppressed when caching is disabled (ttl 0), so `--cache-ttl 0`
+                // really means "no caching of anything".
+                Outcome::Failed(msg) if !self.ttl.is_zero() && age < FAILURE_GRACE => {
+                    let msg = msg.clone();
+                    drop(entry);
+                    bail!("{msg} (shared with a concurrent request for the same URL)");
+                }
+                _ => {}
+            }
+        }
+
+        let outcome = fetch().await;
+        let result = match outcome {
+            Ok(body) => {
+                *entry = Some(CachedPage {
+                    outcome: Outcome::Body(body.clone()),
+                    fetched_at: Instant::now(),
+                });
+                Ok((body, false))
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                *entry = Some(CachedPage {
+                    outcome: Outcome::Failed(msg.clone()),
+                    fetched_at: Instant::now(),
+                });
+                Err(anyhow::anyhow!(msg))
+            }
         };
         drop(entry);
-        Ok(result)
+        result
+    }
+
+    /// Drop expired entries; if that is not enough, drop the oldest.
+    ///
+    /// Called only when inserting a NEW key, so a cache-hit path never pays for
+    /// eviction.
+    fn evict(&self, slots: &mut HashMap<String, Slot>) {
+        if slots.len() < self.max_entries {
+            return;
+        }
+        let now = Instant::now();
+        let ttl = self.ttl;
+        // Keep a slot if it is in flight (try_lock fails -> a waiter depends on
+        // it) or if its page is still fresh. Note the polarity: `try_lock`
+        // FAILING means keep, so this cannot evict a slot out from under a
+        // concurrent fetch.
+        // Polarity matters: try_lock FAILING means in flight, so keep it. This
+        // cannot evict a slot out from under a concurrent fetch.
+        slots.retain(|_, slot| {
+            slot.try_lock().map_or(true, |guard| {
+                guard.as_ref().is_some_and(|page| {
+                    let life = match page.outcome {
+                        Outcome::Body(_) => ttl,
+                        Outcome::Failed(_) => FAILURE_GRACE,
+                    };
+                    now.saturating_duration_since(page.fetched_at) < life
+                })
+            })
+        });
+        // Still full: evict the oldest fetched entry to make room.
+        while slots.len() >= self.max_entries {
+            let oldest = slots
+                .iter()
+                .filter_map(|(k, slot)| {
+                    let at = slot.try_lock().ok()?.as_ref()?.fetched_at;
+                    Some((k.clone(), at))
+                })
+                .min_by_key(|(_, at)| *at)
+                .map(|(k, _)| k);
+            match oldest {
+                Some(k) => {
+                    slots.remove(&k);
+                }
+                // Everything left is locked (in flight) - leave it alone.
+                None => break,
+            }
+        }
     }
 }
 
@@ -447,38 +552,21 @@ impl Toolbox {
         if !self.web {
             bail!("web access is disabled for this run");
         }
-        let url = args
+        let raw = args
             .get("url")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("fetch_url needs a 'url'"))?;
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            bail!("only http(s) URLs are allowed");
+        let url = Url::parse(raw.trim()).map_err(|e| anyhow::anyhow!("bad url: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("only http(s) URLs are allowed (got '{}')", url.scheme());
         }
 
+        // Cache on the normalised URL so trivial spelling differences still hit.
+        let key = url.as_str().to_owned();
         let (body, cached) = self
             .cache
-            .get_or_fetch(url, || async {
-                // Everything expensive lives inside the miss path: a cache hit
-                // must not pay the politeness delay, and must not consume a
-                // request from the host budget either.
-                self.rate.acquire(&host_of(url)).await?;
-                let resp = http
-                    .get(url)
-                    .header(
-                        "user-agent",
-                        "council/0.1 (+https://github.com/NielsMooren/council)",
-                    )
-                    .timeout(Duration::from_secs(30))
-                    .send()
-                    .await?;
-                let status = resp.status();
-                let raw = resp.text().await?;
-                if !status.is_success() {
-                    // Deliberately NOT cached - a transient 503 must not be
-                    // remembered for the whole TTL.
-                    bail!("HTTP {status}");
-                }
-                Ok(strip_html(&raw))
+            .get_or_fetch(&key, || async {
+                self.fetch_following_redirects(http, url.clone()).await
             })
             .await?;
 
@@ -497,20 +585,128 @@ impl Toolbox {
         }
         Ok(text)
     }
+
+    /// Hard ceiling on bytes ingested from one response, before decompression
+    /// is accounted for. Ten times the text we are willing to hand the model,
+    /// which leaves room for markup while still bounding memory.
+    const fn max_response_bytes(&self) -> usize {
+        self.cap().saturating_mul(10)
+    }
+
+    /// Read a response body with a running byte limit.
+    ///
+    /// `resp.text()` buffers the WHOLE body first, which is a self-DoS: gzip and
+    /// brotli are enabled and reqwest decompresses transparently, so a small
+    /// compressed response can expand into a large `String` - and then
+    /// `strip_html` allocates again and the cache clones again. Truncating the
+    /// final string does not help; the allocation has already happened. The
+    /// limit has to gate ingestion, which means streaming.
+    async fn read_capped(resp: reqwest::Response, limit: usize) -> Result<String> {
+        // Refuse early when the server declares an oversized body.
+        if let Some(len) = resp.content_length() {
+            if usize::try_from(len).unwrap_or(usize::MAX) > limit {
+                bail!("response too large: Content-Length {len} exceeds {limit} bytes");
+            }
+        }
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("stream error")?;
+            if buf.len().saturating_add(chunk.len()) > limit {
+                // Keep what we have and stop pulling. A truncated document is
+                // more useful to a panellist than an error, and the point of the
+                // cap is to bound memory, which it now does.
+                let take = limit.saturating_sub(buf.len());
+                buf.extend_from_slice(chunk.get(..take).unwrap_or(&chunk));
+                break;
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// Follow redirects manually, charging the rate limiter for EVERY hop.
+    ///
+    /// reqwest's automatic redirect following is disabled for this reason: it
+    /// would turn one reservation on the original origin into up to ten
+    /// unmetered requests to arbitrary other origins, so a chain of redirectors
+    /// could hammer a host at unlimited rate while the limiter reported
+    /// everything was fine. Accounting evasion, no attacker required.
+    async fn fetch_following_redirects(
+        &self,
+        http: &reqwest::Client,
+        mut url: Url,
+    ) -> Result<String> {
+        // Same ceiling reqwest uses by default, so behaviour is unsurprising.
+        const MAX_HOPS: usize = 10;
+
+        for hop in 0..=MAX_HOPS {
+            // Charge the origin we are ABOUT to contact, on every hop.
+            self.rate.acquire(&origin_of(&url)).await?;
+            let resp = http
+                .get(url.clone())
+                .header(
+                    "user-agent",
+                    "council/0.1 (+https://github.com/NielsMooren/council)",
+                )
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await?;
+
+            let status = resp.status();
+            if status.is_redirection() {
+                let location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| anyhow::anyhow!("HTTP {status} with no usable Location"))?;
+                // Resolve relative Locations against the current URL.
+                let next = url
+                    .join(location)
+                    .map_err(|e| anyhow::anyhow!("bad redirect target '{location}': {e}"))?;
+                if !matches!(next.scheme(), "http" | "https") {
+                    bail!("redirect to non-http(s) scheme '{}' refused", next.scheme());
+                }
+                if hop == MAX_HOPS {
+                    bail!("too many redirects (>{MAX_HOPS})");
+                }
+                url = next;
+                continue;
+            }
+
+            // Check status BEFORE reading the body: no reason to buffer a
+            // megabyte of error page.
+            if !status.is_success() {
+                // Deliberately NOT cached - a transient 503 must not be
+                // remembered for the whole TTL.
+                bail!("HTTP {status}");
+            }
+            let text = Self::read_capped(resp, self.max_response_bytes()).await?;
+            return Ok(strip_html(&text));
+        }
+        bail!("too many redirects (>{MAX_HOPS})")
+    }
 }
-/// Host portion of a URL, for rate-limit bookkeeping.
+/// Rate-limit bucket key for a URL: `scheme://host:port`.
 ///
-/// Deliberately string-based rather than pulling in a URL parser: we only need a
-/// stable bucket key, and a malformed URL will fail at the request anyway.
-fn host_of(url: &str) -> String {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    // Strip credentials and port so the bucket is per-host, not per-URL.
-    let host = host.rsplit('@').next().unwrap_or(host);
-    host.split(':').next().unwrap_or(host).to_ascii_lowercase()
+/// A real origin, parsed by `url::Url` rather than string-splitting. The previous
+/// hand-rolled version collapsed every IPv6 address into one bucket, because
+/// `split(':')` does not know that `[::1]` is full of colons:
+///
+/// ```text
+/// http://[::1]:8080/x      -> "["        (verified, not theoretical)
+/// https://[2001:db8::1]/y  -> "[2001"
+/// ```
+///
+/// Keeping scheme and port is what makes this an origin rather than a hostname:
+/// `http://x.com` and `https://x.com:8443` are genuinely different servers.
+fn origin_of(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("<no-host>").to_ascii_lowercase();
+    let scheme = url.scheme();
+    url.port_or_known_default().map_or_else(
+        || format!("{scheme}://{host}"),
+        |port| format!("{scheme}://{host}:{port}"),
+    )
 }
 
 /// Crude tag stripper. Good enough for docs and specs; we are feeding a language
@@ -594,4 +790,166 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub args: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The old string-splitting `host_of` collapsed every IPv6 address into one
+    /// bucket. These cases exist so that regression cannot come back silently.
+    #[test]
+    fn origin_of_handles_ipv6_ports_and_case() {
+        let cases = [
+            ("http://[::1]:8080/x", "http://[::1]:8080"),
+            ("https://[2001:db8::1]/y", "https://[2001:db8::1]:443"),
+            ("http://EXAMPLE.com/z", "http://example.com:80"),
+            ("https://example.com:8443/a", "https://example.com:8443"),
+            ("http://user:pw@example.com/q", "http://example.com:80"),
+            // Distinct ports and schemes are distinct origins, which is the
+            // whole point of using an origin rather than a bare hostname.
+            ("http://example.com/a", "http://example.com:80"),
+            ("https://example.com/a", "https://example.com:443"),
+        ];
+        for (input, want) in cases {
+            let url = Url::parse(input).expect("test url should parse");
+            assert_eq!(origin_of(&url), want, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn ipv6_addresses_are_not_all_one_bucket() {
+        let a = Url::parse("http://[::1]:8080/").expect("parse");
+        let b = Url::parse("http://[2001:db8::1]:8080/").expect("parse");
+        assert_ne!(
+            origin_of(&a),
+            origin_of(&b),
+            "distinct IPv6 hosts must not share a rate-limit bucket"
+        );
+    }
+
+    #[test]
+    fn strip_html_drops_script_and_style_content() {
+        // Built by concatenation so clippy does not mistake CSS braces for
+        // format arguments.
+        let html = [
+            "<html><head><script>var x=1;</script>",
+            "<style>p",
+            "{",
+            "color:red",
+            "}",
+            "</style></head>",
+            "<body><p>Caf\u{e9} \u{20ac}</p></body></html>",
+        ]
+        .concat();
+        let out = strip_html(&html);
+        assert!(!out.contains("var x"), "script body leaked: {out}");
+        assert!(!out.contains("color:red"), "style body leaked: {out}");
+        assert!(out.contains("Caf\u{e9}"), "non-ASCII text lost: {out}");
+        assert!(out.contains('\u{20ac}'), "non-ASCII text lost: {out}");
+    }
+
+    #[test]
+    fn strip_html_survives_unterminated_tag() {
+        // A truncated document must not panic or hang.
+        assert_eq!(strip_html("<p>hi<span"), "hi");
+    }
+
+    /// Rate-limit slots must chain off each other, not off the wall clock, or
+    /// concurrent callers all compute wait=0 and fire together.
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_spaces_concurrent_callers() {
+        let rate = RateLimit::new(Duration::from_millis(500), 10);
+        let start = tokio::time::Instant::now();
+        // Three back-to-back acquires: 0ms, 500ms, 1000ms.
+        for expect_ms in [0_u64, 500, 1000] {
+            rate.acquire("http://example.com:80")
+                .await
+                .expect("within budget");
+            let elapsed = start.elapsed().as_millis();
+            assert_eq!(
+                u64::try_from(elapsed).unwrap_or(u64::MAX),
+                expect_ms,
+                "acquire should be spaced by the interval"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_budget_is_a_hard_stop() {
+        let rate = RateLimit::new(Duration::ZERO, 2);
+        assert!(rate.acquire("http://a:80").await.is_ok());
+        assert!(rate.acquire("http://a:80").await.is_ok());
+        let err = rate
+            .acquire("http://a:80")
+            .await
+            .expect_err("third call must be refused");
+        assert!(
+            format!("{err:#}").contains("rate limit"),
+            "error should name the limit: {err:#}"
+        );
+        // A different origin has its own budget.
+        assert!(rate.acquire("http://b:80").await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cache_serves_within_ttl_and_refetches_after() {
+        let cache = UrlCache::new(Duration::from_secs(600));
+        let (body, hit) = cache
+            .get_or_fetch("u", || async { Ok("one".to_owned()) })
+            .await
+            .expect("first fetch");
+        assert_eq!((body.as_str(), hit), ("one", false));
+
+        // Inside the TTL: the closure must not run again.
+        let (body, hit) = cache
+            .get_or_fetch("u", || async { panic!("must not refetch inside ttl") })
+            .await
+            .expect("cached");
+        assert_eq!((body.as_str(), hit), ("one", true));
+
+        tokio::time::advance(Duration::from_secs(601)).await;
+        let (body, hit) = cache
+            .get_or_fetch("u", || async { Ok("two".to_owned()) })
+            .await
+            .expect("refetch after ttl");
+        assert_eq!((body.as_str(), hit), ("two", false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cache_shares_a_recent_failure_then_allows_retry() {
+        let cache = UrlCache::new(Duration::from_secs(600));
+        let first = cache
+            .get_or_fetch("u", || async { bail!("boom") })
+            .await
+            .expect_err("should fail");
+        assert!(format!("{first:#}").contains("boom"));
+
+        // Within the grace window a peer inherits the error instead of starting
+        // its own attempt - the difference between one 30s timeout and N.
+        let shared = cache
+            .get_or_fetch("u", || async { panic!("must not refetch during grace") })
+            .await
+            .expect_err("should inherit");
+        assert!(format!("{shared:#}").contains("shared with a concurrent request"));
+
+        tokio::time::advance(FAILURE_GRACE + Duration::from_secs(1)).await;
+        let (body, hit) = cache
+            .get_or_fetch("u", || async { Ok("recovered".to_owned()) })
+            .await
+            .expect("retry after grace");
+        assert_eq!((body.as_str(), hit), ("recovered", false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cache_ttl_zero_disables_everything() {
+        let cache = UrlCache::new(Duration::ZERO);
+        for _ in 0..3 {
+            let (_, hit) = cache
+                .get_or_fetch("u", || async { Ok("x".to_owned()) })
+                .await
+                .expect("fetch");
+            assert!(!hit, "ttl 0 must never serve from cache");
+        }
+    }
 }
