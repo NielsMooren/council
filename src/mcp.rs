@@ -126,22 +126,96 @@ for factual lookups or tasks with a single correct answer."
         Ok(s)
     }
 
-    /// List configured panels and providers, so a caller can pick a panel
-    /// without reading the config file.
-    #[tool(description = "List the panels and providers available in the council config.")]
+    /// The registry of models a caller can put on a council.
+    ///
+    /// Call this before `deliberate` when you do not already know the handles:
+    /// it is the authoritative list, and passing an unregistered handle is an
+    /// error rather than a silent fallback.
+    #[tool(
+        description = "List the model handles available for a council, with their provider, \
+whether the provider's API key is present, and whether each model is currently usable. Call this \
+before `deliberate` to discover what you can pass to its `with` argument."
+    )]
+    pub async fn models(&self) -> Result<String, ErrorData> {
+        let cfg = self.cfg()?;
+        if cfg.models.is_empty() {
+            return Ok(
+                "The model registry is empty. Add `[[models]]` entries to the council \
+                       config, or pass `provider:model` directly to `deliberate`."
+                    .to_owned(),
+            );
+        }
+
+        let mut s = String::from(
+            "## Available models\n\n\
+             Pass these handles to `deliberate`'s `with` argument, e.g. \
+             `with: [\"opus\", \"sol\"]`.\n\n\
+             | handle | provider | model | usable |\n|---|---|---|---|\n",
+        );
+        let mut unusable = Vec::new();
+        for m in &cfg.models {
+            // "Usable" means the provider exists AND its key is in the env - the
+            // two things that make a call fail before it is even sent.
+            let (usable, why) = match cfg.provider(&m.provider) {
+                Ok(p) if std::env::var(&p.api_key_env).is_ok() => ("yes", None),
+                Ok(p) => ("no", Some(format!("{} not set", p.api_key_env))),
+                Err(_) => ("no", Some(format!("unknown provider '{}'", m.provider))),
+            };
+            let _ = writeln!(
+                s,
+                "| `{}` | {} | {} | {}{} |",
+                m.name,
+                m.provider,
+                m.model,
+                usable,
+                why.as_ref().map_or_else(String::new, |w| format!(" ({w})"))
+            );
+            if let Some(w) = why {
+                unusable.push(format!("{} — {w}", m.name));
+            }
+        }
+
+        if !unusable.is_empty() {
+            s.push_str("\n**Not usable right now** (do not select these):\n");
+            for u in &unusable {
+                let _ = writeln!(s, "- {u}");
+            }
+        }
+
+        s.push_str(
+            "\n### Choosing\n\
+             - Diversity beats size: two models from *different* providers disagree more \
+             usefully than three from one. The disagreement is the point.\n\
+             - Cost is `members x rounds + 1` (the +1 is the chair). Start with 2 members \
+             and 1 round; widen only if they split.\n\
+             - `rounds`: 1 = independent opinions, 2 = + cross-examination, \
+             3 = + commitment (default), 4-6 = genuinely contested designs.\n\
+             - You may rename a member for the transcript with `Alias=handle`, or use \
+             `provider:model` for a model that is not registered.\n",
+        );
+        Ok(s)
+    }
+
+    /// List configured panels, so a caller can pick a ready-made roster.
+    #[tool(
+        description = "List the pre-configured panels (named rosters of models) and the \
+providers they use. Use a panel name as `deliberate`'s `panel` argument, or ignore panels \
+entirely and pass `with` to choose models yourself."
+    )]
     pub async fn panels(&self) -> Result<String, ErrorData> {
         let cfg = self.cfg()?;
-        let mut s = String::from("## Models (handles for `with`)\n");
-        for m in &cfg.models {
-            let _ = writeln!(s, "- `{}` — {}:{}", m.name, m.provider, m.model);
+        let mut s = String::from("## Panels\n");
+        if cfg.panels.is_empty() {
+            s.push_str("\n(none configured — use `deliberate`'s `with` argument instead)\n");
         }
-        if cfg.models.is_empty() {
-            s.push_str("- (registry empty; add [[models]] to the config)\n");
-        }
-        s.push_str("\n## Panels\n");
         for p in &cfg.panels {
             let chair = p.chair.as_deref().unwrap_or("(last member)");
-            let _ = writeln!(s, "\n### {} — chair: {chair}", p.name);
+            let default = if cfg.default_panel.as_deref() == Some(p.name.as_str()) {
+                "  [default]"
+            } else {
+                ""
+            };
+            let _ = writeln!(s, "\n### {} — chair: {chair}{default}", p.name);
             match cfg.resolve(p) {
                 Ok(rp) => {
                     for m in &rp.members {
@@ -162,6 +236,7 @@ for factual lookups or tasks with a single correct answer."
             };
             let _ = writeln!(s, "- {} — {:?} @ {} ({})", p.name, p.api, p.base_url, key);
         }
+        s.push_str("\nCall `models` for the individual handles you can mix yourself.\n");
         Ok(s)
     }
 }
@@ -182,10 +257,16 @@ impl ServerHandler for Council {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Multi-model deliberation. `deliberate` convenes a panel of different LLMs to \
-                 debate a question over several rounds and returns a consensus document that \
-                 separates genuine agreement from unresolved disagreement. `panels` lists \
-                 available panels.",
+                "Multi-model deliberation: several LLMs debate a question over rounds, then a \
+                 chair synthesises where they genuinely agree and where they do not.\n\n\
+                 Workflow: call `models` to see which model handles are available and usable, \
+                 then call `deliberate` with `with: [handles]` to choose the council, or omit \
+                 `with` to use the default panel. `panels` lists pre-configured rosters.\n\n\
+                 Use this for consequential, contestable decisions - architecture choices, \
+                 risky trade-offs, design review - where disagreement between \
+                 differently-trained models surfaces assumptions a single model states \
+                 confidently. Do not use it for factual lookups or tasks with one correct \
+                 answer: you pay N times for the same reply.",
             )
     }
 }

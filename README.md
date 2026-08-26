@@ -45,12 +45,18 @@ Add to your MCP client config:
 
 For Hermes: `hermes mcp add council -- council serve`
 
-Two tools appear:
+Three tools appear:
 
 | tool | purpose |
 |---|---|
-| `deliberate` | convene the panel on a question, return a consensus document |
-| `panels` | list configured panels and providers |
+| `models` | list available model handles, their provider, and whether each is **usable** right now (provider known + API key present) |
+| `panels` | list pre-configured rosters |
+| `deliberate` | convene a council on a question, return a consensus document |
+
+An agent's workflow is `models` → `deliberate(with: [...])`. The `models` output
+also carries the selection guidance (diversity beats size, cost is
+`members × rounds + 1`, what each round count buys), so the agent can size a run
+sensibly without being told.
 
 `deliberate` takes `question` (required) plus, all optional:
 
@@ -64,7 +70,7 @@ Two tools appear:
 | `max_tokens` | per-member ceiling for this run |
 | `include_transcript` | return the full debate, not just the consensus |
 
-Call `panels` first to see the registry handles and rosters.
+Call `models` first to discover handles; `panels` for ready-made rosters.
 
 **When to reach for it:** consequential, contestable decisions — architecture,
 risky trade-offs, plan review, "is this design sound". **When not to:** factual
@@ -270,7 +276,7 @@ If you extend this crate, keep the lints on. They pay for themselves.
 
 ## Verification
 
-78 ad-hoc checks across three harnesses, run against fake in-process SSE servers
+84 ad-hoc checks across three harnesses, run against fake in-process SSE servers
 (no tokens spent):
 
 - **OpenAI path (32):** full 3-round × 3-member run, request accounting, round-1
@@ -280,11 +286,11 @@ If you extend this crate, keep the lints on. They pay for themselves.
 - **Anthropic path (19):** wire shape, custom auth headers, `${ENV}` expansion,
   `thinking_delta` exclusion, the zero-text failure mode, truncation detection,
   partial-panel degradation.
-- **Runtime selection (27):** registry discovery, `--with` running exactly the
+- **Runtime selection (33):** registry discovery, `--with` running exactly the
   chosen models, round count driving call count, chair selection, aliases, the
   `provider:model` escape hatch, rejection of unknown handles / bad chairs /
-  one-member panels, `--with` overriding `--panel`, `--max-tokens`, and the same
-  knobs over MCP.
+  one-member panels, `--with` overriding `--panel`, `--max-tokens`, the `models`
+  MCP endpoint (including unusable-model flagging), and the same knobs over MCP.
 
 `cargo clippy --all-targets` and `cargo fmt --check` are clean. There is no
 unit-test suite yet — the harnesses are the evidence, and they exercise the real

@@ -203,7 +203,46 @@ run("ask", "Qt?", "--with", "alpha,beta", "--rounds", "1", "--max-tokens", "777"
 check("--max-tokens applied to members", any(x["max"] == 777 for x in REQS),
       [x["max"] for x in REQS])
 
-print("\n8. MCP: same knobs over the wire")
+print("\n8. models tool flags an unusable model")
+bad_cfg = tmp / "badkey.toml"
+bad_cfg.write_text(cfg.read_text() + """
+[[providers]]
+name = "keyless"
+api = "openai_chat"
+base_url = "http://127.0.0.1:1/v1"
+api_key_env = "DEFINITELY_NOT_SET_XYZ"
+auth = "bearer"
+
+[[models]]
+name = "orphan"
+provider = "keyless"
+model = "model-orphan"
+""")
+msgs_u = [
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+     "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "p", "version": "1"}}},
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+     "params": {"name": "models", "arguments": {}}},
+]
+pu = subprocess.run([BIN, "-c", str(bad_cfg), "serve"],
+                    input="\n".join(json.dumps(m) for m in msgs_u) + "\n",
+                    capture_output=True, text=True, env=env, timeout=120)
+utxt = ""
+for line in pu.stdout.splitlines():
+    try:
+        d = json.loads(line.strip())
+    except (json.JSONDecodeError, ValueError):
+        continue
+    if d.get("id") == 2:
+        utxt = d["result"]["content"][0]["text"]
+check("missing key marks the model unusable",
+      "orphan" in utxt and "DEFINITELY_NOT_SET_XYZ" in utxt, utxt[-300:])
+check("unusable models called out separately",
+      "Not usable right now" in utxt, utxt[-300:])
+
+print("\n9. MCP: same knobs over the wire")
 msgs = [
     {"jsonrpc": "2.0", "id": 1, "method": "initialize",
      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
@@ -215,6 +254,8 @@ msgs = [
                 "arguments": {"question": "MCP?", "with": ["gamma", "delta"], "rounds": 1}}},
     {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
      "params": {"name": "panels", "arguments": {}}},
+    {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+     "params": {"name": "models", "arguments": {}}},
 ]
 REQS.clear()
 p = subprocess.run([BIN, "-c", str(cfg), "serve"],
@@ -241,9 +282,19 @@ check("MCP with=[gamma,delta] ran those models",
       models_used() == ["model-delta", "model-gamma"], models_used())
 check("MCP call returned content", 3 in out and out[3]["result"]["content"][0]["text"],
       str(out.get(3))[:160])
-check("panels tool lists the registry",
-      4 in out and "alpha" in out[4]["result"]["content"][0]["text"],
+check("three tools exposed: deliberate/models/panels",
+      2 in out and {t["name"] for t in out[2]["result"]["tools"]} ==
+      {"deliberate", "models", "panels"},
+      [t["name"] for t in out.get(2, {}).get("result", {}).get("tools", [])])
+check("panels tool lists rosters",
+      4 in out and "Pragmatist" in out[4]["result"]["content"][0]["text"],
       str(out.get(4))[:200])
+mt = out.get(5, {}).get("result", {}).get("content", [{}])[0].get("text", "")
+check("models tool lists every handle",
+      all(h in mt for h in ("alpha", "beta", "gamma", "delta")), mt[:200])
+check("models tool reports usability", "usable" in mt and "yes" in mt, mt[:200])
+check("models tool explains how to choose",
+      "rounds" in mt and "with" in mt, mt[-300:])
 
 srv.shutdown()
 print(f"\n{n - len(fails)}/{n} passed")

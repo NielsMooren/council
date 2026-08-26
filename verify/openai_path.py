@@ -184,9 +184,10 @@ check("initialize responds", 1 in out, list(out))
 if 1 in out:
     check("server identifies as council",
           out[1]["result"]["serverInfo"]["name"] == "council", out[1]["result"]["serverInfo"])
-check("tools/list = deliberate + panels",
-      2 in out and {t["name"] for t in out[2]["result"]["tools"]} == {"deliberate", "panels"},
-      out.get(2, {}).get("result", {}).get("tools"))
+check("tools/list = deliberate + models + panels",
+      2 in out and {t["name"] for t in out[2]["result"]["tools"]} ==
+      {"deliberate", "models", "panels"},
+      [t["name"] for t in out.get(2, {}).get("result", {}).get("tools", [])])
 if 2 in out:
     dl = next(t for t in out[2]["result"]["tools"] if t["name"] == "deliberate")
     check("deliberate requires only 'question'",
