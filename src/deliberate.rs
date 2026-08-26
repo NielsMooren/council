@@ -116,6 +116,7 @@ Each side's best argument, and what evidence would settle it. Do not paper over 
 
 ## Decision
 The recommended course of action, with a confidence level and the reasoning.
+An explicit 'insufficient evidence to decide' is a VALID and sometimes correct answer - say what is missing and what would settle it. Do not manufacture a recommendation just to fill this heading.
 
 ## Red lines
 What must not be done.
@@ -124,16 +125,35 @@ What must not be done.
 Positions that actually moved, and why. This is the highest-signal section - be specific.";
 
 impl Deliberation {
+    /// Cache key for a run.
+    ///
+    /// Must cover EVERYTHING that changes what a member is asked, or a warm
+    /// cache silently serves output produced under a different protocol. This
+    /// was verified as a live bug: two runs differing only in persona text
+    /// collided on one key, so run 2 replayed run 1's answers.
+    ///
+    /// `PROTOCOL_VERSION` is the manual escape hatch - bump it whenever the
+    /// prompts in this file change, since their text is not otherwise hashed.
     fn cache_key(&self, panel: &ResolvedPanel) -> String {
+        /// Bump on any change to `RULES`, `TOOL_RULES`, `round_prompt` or `SYNTH`.
+        const PROTOCOL_VERSION: u32 = 2;
+
         let mut h = Sha256::new();
+        h.update(PROTOCOL_VERSION.to_le_bytes());
         h.update(self.question.as_bytes());
         h.update(self.context.as_deref().unwrap_or("").as_bytes());
         h.update(panel.name.as_bytes());
         h.update([self.rounds]);
+        // The chair authors consensus.md; a different chair is a different run.
+        h.update(panel.chair.as_deref().unwrap_or("<last-member>").as_bytes());
         for m in &panel.members {
             h.update(m.name.as_bytes());
             h.update(m.provider.as_bytes());
             h.update(m.model.as_bytes());
+            // Persona is part of the system prompt, so it changes the question.
+            h.update(m.persona.as_deref().unwrap_or("").as_bytes());
+            // Per-member ceilings can truncate an answer.
+            h.update(m.max_tokens.unwrap_or(0).to_le_bytes());
         }
         if let Some(mt) = self.max_tokens {
             h.update(mt.to_le_bytes());
@@ -200,8 +220,25 @@ impl Deliberation {
                 )
                 .await?;
             let _ = writeln!(transcript, "\n########## ROUND {round} ##########");
+            // Absent members are named in the transcript. Without this, later
+            // rounds and the chair reason as if the panel were complete - a
+            // 2-of-4 panel reads identically to a 4-of-4 one.
             for (name, text) in &round_out {
                 let _ = writeln!(transcript, "\n===== {name} =====\n{text}");
+            }
+            let absent: Vec<&str> = panel
+                .members
+                .iter()
+                .map(|m| m.name.as_str())
+                .filter(|n| !round_out.iter().any(|(got, _)| got == n))
+                .collect();
+            if !absent.is_empty() {
+                let _ = writeln!(
+                    transcript,
+                    "\n===== ABSENT THIS ROUND =====\n{} did not respond. Weigh the \
+                     remaining positions accordingly; this was not a full panel.",
+                    absent.join(", ")
+                );
             }
         }
 
@@ -346,5 +383,87 @@ impl Deliberation {
                 .unwrap_or(usize::MAX)
         });
         Ok(round_out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::Member;
+
+    fn member(name: &str, persona: Option<&str>) -> Member {
+        Member {
+            name: name.to_owned(),
+            provider: "p".to_owned(),
+            model: "m".to_owned(),
+            max_tokens: None,
+            persona: persona.map(str::to_owned),
+        }
+    }
+
+    fn deliberation() -> Deliberation {
+        Deliberation {
+            question: "same question".to_owned(),
+            context: None,
+            rounds: 1,
+            panel: ResolvedPanel {
+                name: "p".to_owned(),
+                members: vec![member("A", None), member("B", None)],
+                chair: Some("A".to_owned()),
+            },
+            max_tokens: None,
+            tools: Toolbox::default(),
+            resume: true,
+        }
+    }
+
+    /// Regression: a run differing only in persona text collided on one cache
+    /// key, so the second run replayed the first run's answers. Verified as a
+    /// live bug before the fix.
+    #[test]
+    fn cache_key_separates_personas() {
+        let base = deliberation();
+        let mut changed = deliberation();
+        changed.panel.members[0] = member("A", Some("argue for speed"));
+        assert_ne!(
+            base.cache_key(&base.panel),
+            changed.cache_key(&changed.panel),
+            "persona is part of the system prompt and must change the key"
+        );
+    }
+
+    #[test]
+    fn cache_key_separates_chairs() {
+        let base = deliberation();
+        let mut changed = deliberation();
+        changed.panel.chair = Some("B".to_owned());
+        assert_ne!(
+            base.cache_key(&base.panel),
+            changed.cache_key(&changed.panel),
+            "the chair authors consensus.md, so it must change the key"
+        );
+    }
+
+    #[test]
+    fn cache_key_separates_member_token_ceilings() {
+        let base = deliberation();
+        let mut changed = deliberation();
+        changed.panel.members[0].max_tokens = Some(500);
+        assert_ne!(
+            base.cache_key(&base.panel),
+            changed.cache_key(&changed.panel),
+            "a per-member ceiling can truncate an answer"
+        );
+    }
+
+    #[test]
+    fn cache_key_is_stable_for_identical_input() {
+        let a = deliberation();
+        let b = deliberation();
+        assert_eq!(
+            a.cache_key(&a.panel),
+            b.cache_key(&b.panel),
+            "resume depends on the key being deterministic"
+        );
     }
 }
