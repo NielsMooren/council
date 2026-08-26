@@ -169,10 +169,34 @@ council ask "..." --web --host-delay-ms 1000 --host-budget 20   # defaults
 Different hosts do not block each other. Over MCP the defaults are fixed: a
 program caller does not get to dial politeness down.
 
-Still absent, and deliberately so: no `robots.txt` handling, no caching, no
-conditional GET. Those are crawler concerns, and `fetch_url` is a one-shot
-user-directed fetch. **Do not build recursive or bulk crawling on this** without
-adding them first.
+#### URL cache
+
+Fetched pages are cached for 10 minutes and shared across the whole
+deliberation, so a panel reading the same spec costs **one** request:
+
+```bash
+council ask "..." --web --cache-ttl 600    # default; 0 disables
+```
+
+The important part is **single-flight de-duplication**. A plain check-then-fill
+cache does not help here: four members starting concurrently all miss, all
+fetch, and the cache only benefits a fifth request that never comes. Each URL
+gets its own lock held across the fetch, so concurrent readers of the same URL
+queue behind one real request. Measured: two members fetching the same URL
+simultaneously produce exactly one upstream hit.
+
+- Cache hits pay **no** politeness delay and consume **no** host budget — they
+  never touch the network.
+- Hits are disclosed to the model (`(from cache: ...)`) so a panellist can say
+  so if freshness matters to its argument.
+- Failures are **not** cached; a transient 503 must not be remembered for ten
+  minutes.
+- Keyed on the full URL, so distinct paths on one host are distinct entries.
+
+Still absent, and deliberately so: no `robots.txt` handling and no conditional
+GET (`ETag`/`If-Modified-Since`). Those are crawler concerns, and `fetch_url` is
+a one-shot user-directed fetch. **Do not build recursive or bulk crawling on
+this** without adding them first.
 
 Every lookup is recorded in the transcript, so you can audit what a claim was
 actually based on:
@@ -374,7 +398,7 @@ If you extend this crate, keep the lints on. They pay for themselves.
 
 ## Verification
 
-129 ad-hoc checks across five harnesses, run against fake in-process SSE servers
+141 ad-hoc checks across five harnesses, run against fake in-process SSE servers
 (no tokens spent):
 
 - **OpenAI path (32):** full 3-round × 3-member run, request accounting, round-1
@@ -389,10 +413,12 @@ If you extend this crate, keep the lints on. They pay for themselves.
   sandbox escapes refused (absolute paths, `..`, nested traversal), tool errors
   handed back to the model rather than aborting, the loop being bounded, the
   audit trail, and cache-key separation for tool-enabled runs.
-- **Web politeness (18):** `Accept-Encoding` actually on the wire, per-host
-  spacing *measured* from arrival timestamps, spacing shared across concurrent
-  members, different hosts not serialised, the budget as a hard stop with an
-  explanatory refusal, and limits reported to the operator.
+- **Web politeness & caching (30):** `Accept-Encoding` actually on the wire,
+  per-host spacing *measured* from arrival timestamps, spacing shared across
+  concurrent members, different hosts not serialised, the budget as a hard stop
+  with an explanatory refusal, concurrent members collapsing to one fetch,
+  cache hits bypassing both the delay and the budget, distinct URLs cached
+  separately, `--cache-ttl 0` disabling it, and failures never being cached.
 - **Runtime selection (33):** registry discovery, `--with` running exactly the
   chosen models, round count driving call count, chair selection, aliases, the
   `provider:model` escape hatch, rejection of unknown handles / bad chairs /

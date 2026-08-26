@@ -64,6 +64,10 @@ enum Cmd {
         /// Max requests to a single host per deliberation.
         #[arg(long, default_value_t = 20)]
         host_budget: u32,
+        /// Seconds a fetched URL stays cached, so concurrent panellists reading
+        /// the same page cost one request. 0 disables caching.
+        #[arg(long, default_value_t = 600)]
+        cache_ttl: u64,
         /// Named panel from config. Ignored when --with is given.
         #[arg(short, long)]
         panel: Option<String>,
@@ -110,6 +114,7 @@ async fn main() -> Result<()> {
             web,
             host_delay_ms,
             host_budget,
+            cache_ttl,
             panel,
             rounds,
             transcript,
@@ -125,6 +130,7 @@ async fn main() -> Result<()> {
                 web,
                 host_delay_ms,
                 host_budget,
+                cache_ttl,
                 panel,
                 rounds,
                 transcript,
@@ -173,6 +179,7 @@ struct AskOpts {
     web: bool,
     host_delay_ms: u64,
     host_budget: u32,
+    cache_ttl: u64,
     panel: Option<String>,
     rounds: u8,
     transcript: bool,
@@ -198,7 +205,7 @@ async fn ask(config: Option<&std::path::Path>, o: AskOpts) -> Result<()> {
         other => other.map(str::to_owned),
     };
 
-    let tools = council_tools(&o.code, o.web, o.host_delay_ms, o.host_budget)?;
+    let tools = council_tools(&o.code, o.web, o.host_delay_ms, o.host_budget, o.cache_ttl)?;
     if !tools.is_empty() {
         eprintln!(
             "council: tools enabled — roots: [{}], web: {}{}",
@@ -211,9 +218,10 @@ async fn ask(config: Option<&std::path::Path>, o: AskOpts) -> Result<()> {
             tools.web,
             if tools.web {
                 format!(
-                    " (max {} req/host, {}ms apart)",
+                    " (max {} req/host, {}ms apart, {}s cache)",
                     tools.rate.max_per_host,
-                    tools.rate.min_interval.as_millis()
+                    tools.rate.min_interval.as_millis(),
+                    tools.cache.ttl().as_secs()
                 )
             } else {
                 String::new()
@@ -265,6 +273,7 @@ fn council_tools(
     web: bool,
     host_delay_ms: u64,
     host_budget: u32,
+    cache_ttl: u64,
 ) -> Result<tools::Toolbox> {
     let mut roots = Vec::with_capacity(code.len());
     for dir in code {
@@ -281,6 +290,7 @@ fn council_tools(
         web,
         max_bytes: tools::Toolbox::DEFAULT_MAX_BYTES,
         rate: tools::RateLimit::new(std::time::Duration::from_millis(host_delay_ms), host_budget),
+        cache: tools::UrlCache::new(std::time::Duration::from_secs(cache_ttl)),
     })
 }
 

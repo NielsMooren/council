@@ -114,6 +114,97 @@ impl RateLimit {
     }
 }
 
+/// URL cache with single-flight de-duplication.
+///
+/// Two purposes, and the second is the one that actually matters here:
+///
+/// 1. A page fetched once is reused for `ttl`, so a later round does not refetch
+///    what an earlier round already read.
+/// 2. **Concurrent** panellists asking for the same URL collapse into ONE
+///    request. A plain check-then-fill cache does not do this: four members
+///    starting together all miss, all fetch, and the cache only helps the fifth
+///    request that never comes. The per-URL lock below is what makes the
+///    common case - a whole panel reading the same spec - cost one fetch.
+///
+/// Only successful fetches are stored. A transient 503 must not be remembered
+/// for ten minutes.
+/// One URL's cache slot. `Option` is the entry; the `Mutex` around it is the
+/// single-flight gate, so concurrent readers of the same URL queue rather than
+/// racing to fetch it.
+type Slot = Arc<Mutex<Option<CachedPage>>>;
+
+#[derive(Debug, Clone)]
+pub struct UrlCache {
+    ttl: Duration,
+    /// Outer lock is held only briefly, to hand out the per-URL slot.
+    slots: Arc<Mutex<HashMap<String, Slot>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPage {
+    body: String,
+    fetched_at: Instant,
+}
+
+impl Default for UrlCache {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(600))
+    }
+}
+
+impl UrlCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            slots: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub const fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    /// Return the cached body for `url`, or run `fetch` and store its result.
+    ///
+    /// Returns `(body, from_cache)` so the caller can tell the model whether it
+    /// is looking at a fresh read - a panellist citing a page should know if it
+    /// was fetched seconds ago by a peer.
+    async fn get_or_fetch<F, Fut>(&self, url: &str, fetch: F) -> Result<(String, bool)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<String>>,
+    {
+        // Grab (or create) this URL's slot, then release the map so a slow fetch
+        // of one URL never blocks lookups of a different URL.
+        let mut slots = self.slots.lock().await;
+        let slot = Arc::clone(slots.entry(url.to_owned()).or_default());
+        drop(slots);
+
+        // The per-URL guard is deliberately held ACROSS the fetch - that is the
+        // single-flight gate. A concurrent caller for this URL blocks here and
+        // then finds the filled entry instead of issuing a second request.
+        // (clippy::significant_drop_tightening wants it dropped earlier; doing
+        // so would reintroduce the thundering herd this exists to prevent.)
+        let mut entry = slot.lock().await;
+        let fresh = entry.as_ref().and_then(|page| {
+            (Instant::now().saturating_duration_since(page.fetched_at) < self.ttl)
+                .then(|| page.body.clone())
+        });
+        let result = if let Some(body) = fresh {
+            (body, true)
+        } else {
+            let body = fetch().await?;
+            *entry = Some(CachedPage {
+                body: body.clone(),
+                fetched_at: Instant::now(),
+            });
+            (body, false)
+        };
+        drop(entry);
+        Ok(result)
+    }
+}
+
 /// What a deliberation is allowed to look at.
 #[derive(Debug, Clone, Default)]
 pub struct Toolbox {
@@ -126,6 +217,8 @@ pub struct Toolbox {
     pub max_bytes: usize,
     /// Per-origin politeness limiter, shared by every panellist in the run.
     pub rate: RateLimit,
+    /// Fetched pages, shared by every panellist in the run.
+    pub cache: UrlCache,
 }
 
 impl Toolbox {
@@ -361,32 +454,50 @@ impl Toolbox {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             bail!("only http(s) URLs are allowed");
         }
-        // Throttle per host before the request, not after: the point is to not
-        // hit the server too fast, so the wait has to happen first.
-        self.rate.acquire(&host_of(url)).await?;
-        let resp = http
-            .get(url)
-            .header(
-                "user-agent",
-                "council/0.1 (+https://github.com/NielsMooren/council)",
-            )
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
+
+        let (body, cached) = self
+            .cache
+            .get_or_fetch(url, || async {
+                // Everything expensive lives inside the miss path: a cache hit
+                // must not pay the politeness delay, and must not consume a
+                // request from the host budget either.
+                self.rate.acquire(&host_of(url)).await?;
+                let resp = http
+                    .get(url)
+                    .header(
+                        "user-agent",
+                        "council/0.1 (+https://github.com/NielsMooren/council)",
+                    )
+                    .timeout(Duration::from_secs(30))
+                    .send()
+                    .await?;
+                let status = resp.status();
+                let raw = resp.text().await?;
+                if !status.is_success() {
+                    // Deliberately NOT cached - a transient 503 must not be
+                    // remembered for the whole TTL.
+                    bail!("HTTP {status}");
+                }
+                Ok(strip_html(&raw))
+            })
             .await?;
-        let status = resp.status();
-        let body = resp.text().await?;
-        if !status.is_success() {
-            bail!("HTTP {status}");
-        }
-        let mut text = strip_html(&body);
+
+        let mut text = body;
         if text.len() > self.cap() {
             text.truncate(self.cap());
             text.push_str("\n... (truncated)\n");
         }
+        if cached {
+            // Tell the model, so it knows the page was not re-read just now and
+            // can say so if freshness matters to its argument.
+            text.insert_str(
+                0,
+                "(from cache: this URL was already fetched during this deliberation)\n\n",
+            );
+        }
         Ok(text)
     }
 }
-
 /// Host portion of a URL, for rate-limit bookkeeping.
 ///
 /// Deliberately string-based rather than pulling in a URL parser: we only need a

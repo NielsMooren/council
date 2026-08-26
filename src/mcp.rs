@@ -127,6 +127,9 @@ for factual lookups or tasks with a single correct answer."
             // Defaults only: an MCP caller is a program, and letting it dial
             // politeness limits down is exactly how a service becomes abusive.
             rate: crate::tools::RateLimit::default(),
+            // 10-minute TTL: long enough that a multi-round deliberation reads a
+            // page once, short enough that a live doc is not stale by the end.
+            cache: crate::tools::UrlCache::default(),
         };
 
         let d = Deliberation {

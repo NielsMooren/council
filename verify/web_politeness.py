@@ -135,6 +135,11 @@ model = "m-b"
 """)
 env = {**os.environ, "K": "k"}
 URL = f"http://127.0.0.1:{site_port}/spec"
+# A port nobody is listening on, for the "errors are not cached" check.
+_probe = __import__("socket").socket()
+_probe.bind(("127.0.0.1", 0))
+DEAD_PORT = _probe.getsockname()[1]
+_probe.close()
 
 
 def run(urls, *extra, per_model=None, question="Q?"):
@@ -169,18 +174,20 @@ check("no cookies sent", "cookie" not in {k.lower() for k in HEADERS[0]}, list(H
 check("page text reached the model", any("Spec body" in x for x in TOOL_OUT), TOOL_OUT[:1])
 
 print("\n2. per-host spacing is enforced (measured)")
-# 4 sequential fetches per member to the same host, 300ms apart minimum.
-r = run([URL] * 4, "--host-delay-ms", "300", question="Q-spacing")
+# Distinct paths on the SAME host: the cache keys on full URL, so these are all
+# real requests, but they share one host bucket and must be spaced.
+r = run([f"http://127.0.0.1:{site_port}/s{i}" for i in range(4)],
+        "--host-delay-ms", "300", question="Q-spacing")
 check("run succeeds", r.returncode == 0, r.stderr[-300:])
 times = sorted(t for _, t in HITS)
 gaps = [round((b - a) * 1000) for a, b in zip(times, times[1:])]
 check("multiple requests made", len(times) >= 4, len(times))
 # Allow slack for scheduling jitter; the point is that they are NOT bunched.
 check("consecutive requests >= ~300ms apart", all(g >= 240 for g in gaps), gaps)
-# Two members x 4 fetches must interleave through ONE shared queue, so no pair
-# of requests may arrive together even though the members run concurrently.
+# The two members run concurrently and pull from one shared 4-URL script, so
+# every request must still pass through ONE queue: no pair may arrive together.
 check("spacing is shared across members, not per-member",
-      len(gaps) >= 4 and all(g >= 240 for g in gaps), gaps)
+      len(gaps) >= 3 and all(g >= 240 for g in gaps), gaps)
 
 print("\n3. spacing is per-HOST, not global")
 # Second server = different host bucket. Requests to different hosts must not
@@ -206,7 +213,8 @@ else:
 site2.shutdown()
 
 print("\n4. per-host budget is a hard stop")
-r = run([URL] * 8, "--host-delay-ms", "0", "--host-budget", "3", question="Q-budget")
+r = run([f"http://127.0.0.1:{site_port}/b{i}" for i in range(8)],
+        "--host-delay-ms", "0", "--host-budget", "3", question="Q-budget")
 check("run still succeeds", r.returncode == 0, r.stderr[-300:])
 check("requests capped at the shared budget", len(HITS) <= 3,
       f"{len(HITS)} hits, budget 3")
@@ -228,6 +236,52 @@ times = sorted(t for _, t in HITS)
 gaps6 = [round((b - a) * 1000) for a, b in zip(times, times[1:])]
 check("same host, different paths, still throttled",
       len(gaps6) >= 1 and all(g >= 320 for g in gaps6), gaps6)
+
+print("\n7. URL cache: concurrent members collapse to ONE fetch")
+# Both members fetch the SAME url on their first turn, concurrently.
+r = run(None, "--host-delay-ms", "0", question="Q-singleflight", per_model={
+    "m-a": [URL],
+    "m-b": [URL],
+})
+check("run succeeds", r.returncode == 0, r.stderr[-300:])
+check("two members, ONE upstream request", len(HITS) == 1, f"{len(HITS)} hits")
+joined = "\n".join(TOOL_OUT)
+check("both members still got the page", joined.count("Spec body") >= 2, joined[:200])
+check("cache hit is disclosed to the model", "from cache" in joined, joined[:300])
+
+print("\n8. cache survives across rounds and members")
+r = run([URL] * 3, "--host-delay-ms", "0", question="Q-reuse")
+check("repeated fetches of one URL cost one request", len(HITS) == 1, f"{len(HITS)} hits")
+
+print("\n9. different URLs are cached separately")
+r = run([f"http://127.0.0.1:{site_port}/one", f"http://127.0.0.1:{site_port}/two"],
+        "--host-delay-ms", "0", question="Q-distinct")
+check("two distinct URLs = two requests", len(HITS) == 2, f"{len(HITS)} hits")
+
+print("\n10. ttl=0 disables caching")
+r = run([URL] * 3, "--host-delay-ms", "0", "--cache-ttl", "0", question="Q-nocache")
+check("no caching when ttl is 0", len(HITS) >= 3, f"{len(HITS)} hits")
+
+print("\n11. cache hits do not consume the host budget")
+# Budget of 1, but 4 fetches of the same URL: the single real request uses the
+# budget and the rest are served from cache, so nothing is refused.
+r = run([URL] * 4, "--host-delay-ms", "0", "--host-budget", "1", question="Q-budget-cache")
+joined = "\n".join(TOOL_OUT)
+check("one upstream request only", len(HITS) == 1, f"{len(HITS)} hits")
+check("no rate-limit refusal despite budget of 1",
+      "rate limit" not in joined, joined[-200:])
+
+print("\n12. failures are not cached")
+# Point at a closed port: every attempt must retry, not remember the error.
+dead = f"http://127.0.0.1:{DEAD_PORT}/x"
+r = run([dead] * 2, "--host-delay-ms", "0", question="Q-nofailcache")
+joined = "\n".join(TOOL_OUT)
+check("error surfaced to the model", "error" in joined.lower(), joined[:200])
+check("errors not served from cache", "from cache" not in joined, joined[:200])
+
+print("\n13. ttl is reported to the operator")
+r = run([URL], "--cache-ttl", "900", question="Q-ttl-report")
+check("stderr reports the cache ttl", "900s cache" in r.stderr, r.stderr[:300])
 
 site.shutdown()
 llm.shutdown()
