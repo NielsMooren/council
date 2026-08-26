@@ -147,6 +147,22 @@ for factual lookups or tasks with a single correct answer."
             .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))?;
 
         let mut s = out.consensus;
+        // A program cannot infer roster health from prose, so state it plainly:
+        // a 2-of-4 panel is a materially weaker signal than a 4-of-4 one.
+        let absent: Vec<String> = out
+            .members
+            .iter()
+            .filter(|m| !m.ok)
+            .map(|m| format!("{} ({}/{rounds} rounds)", m.name, m.rounds_present))
+            .collect();
+        if !absent.is_empty() {
+            let _ = write!(
+                s,
+                "\n\n---\n### Incomplete panel\n{} did not complete every round. \
+                 Weigh the consensus accordingly.",
+                absent.join(", ")
+            );
+        }
         if !out.failures.is_empty() {
             // Surfaced, not swallowed: a 2-of-4 panel is a weaker signal and the
             // caller must know that before trusting the consensus.

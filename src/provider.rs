@@ -190,13 +190,23 @@ impl Provider {
         let mut research: Vec<ToolRecord> = Vec::new();
 
         for step in 1..=MAX_TOOL_ROUNDS {
-            let turn = self.one_turn(http, &r, &msgs).await?;
+            // A transport failure mid-loop must NOT discard the lookups already
+            // done - that is precisely the run an audit needs to inspect, and
+            // `?` here silently threw them away.
+            let turn = match self.one_turn(http, &r, &msgs).await {
+                Ok(t) => t,
+                Err(e) => return Err(salvage(e, research)),
+            };
             if turn.calls.is_empty() {
-                let text = Self::check(&turn.text, turn.stop.as_deref())?;
-                return Ok(Completion {
-                    text: with_research(text, &research),
-                    research,
-                });
+                match Self::check(&turn.text, turn.stop.as_deref()) {
+                    Ok(text) => {
+                        return Ok(Completion {
+                            text: with_research(text, &research),
+                            research,
+                        });
+                    }
+                    Err(e) => return Err(salvage(e, research)),
+                }
             }
             msgs.push(self.assistant_turn(&turn));
             for call in &turn.calls {
@@ -220,7 +230,10 @@ impl Provider {
             tools: &crate::tools::Toolbox::default(),
             ..r
         };
-        let turn = self.one_turn(http, &closing, &msgs).await?;
+        let turn = match self.one_turn(http, &closing, &msgs).await {
+            Ok(t) => t,
+            Err(e) => return Err(salvage(e, research)),
+        };
         // Do NOT lose a panellist that did all its research and then fumbled the
         // final message - the findings are the expensive part. Fall back to
         // reporting them rather than failing the member out of the round.
@@ -525,7 +538,13 @@ pub struct ToolRecord {
     pub step: usize,
     pub tool: String,
     pub args: Value,
-    /// Full result handed back to the model, not a first line.
+    /// The text the MODEL saw, verbatim - not the raw source.
+    ///
+    /// Deliberately named for what it is: results are size-capped and, for web
+    /// fetches, HTML-stripped before they reach the model. That makes this the
+    /// right artifact for auditing the MODEL ("did it have grounds to say
+    /// that?") and the wrong one for auditing the SOURCE ("is the page itself
+    /// correct?"). Calling it "the full result" would be a lie.
     pub result: String,
     /// Whether the tool reported an error, so failed lookups stay visible.
     pub failed: bool,
@@ -535,6 +554,30 @@ pub struct ToolRecord {
 pub struct Completion {
     pub text: String,
     pub research: Vec<ToolRecord>,
+}
+
+/// An error that still carries the research done before it happened.
+///
+/// Attached to the `anyhow` chain so `run_round` can persist provenance for a
+/// member that died mid-loop. Without this the audit trail is empty for exactly
+/// the runs that most need explaining.
+#[derive(Debug)]
+pub struct Salvaged(pub Vec<ToolRecord>);
+
+impl std::fmt::Display for Salvaged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} lookup(s) completed before the failure", self.0.len())
+    }
+}
+
+impl std::error::Error for Salvaged {}
+
+/// Wrap an error so the partial research survives it.
+fn salvage(e: anyhow::Error, research: Vec<ToolRecord>) -> anyhow::Error {
+    if research.is_empty() {
+        return e;
+    }
+    e.context(Salvaged(research))
 }
 
 /// One model turn: prose, why it stopped, and any tools it wants run.

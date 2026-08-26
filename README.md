@@ -216,12 +216,94 @@ simultaneously produce exactly one upstream hit.
 - **Conditional GET** (`ETag`/`If-Modified-Since`) — cosmetic against a
   run-scoped 10-minute cache.
 - **429/`Retry-After` backoff** — worth adding, not yet done.
-- **Egress policy** (blocking private/link-local/cloud-metadata addresses) —
-  `fetch_url` validates the scheme only, so it can reach anything the host can,
-  including `169.254.169.254`. On a trusted laptop with URLs you choose this is
-  equivalent to having `curl`. **It is not safe to expose to untrusted callers
-  or untrusted URL content**, and partial validation that reads like a security
-  boundary would be worse than none.
+#### What `fetch_url` will and will not do
+
+Local and private addresses are **deliberately reachable** — a panellist reading
+a service on `localhost` or the LAN is a feature, and a local MCP subprocess adds
+no privilege its parent did not already have.
+
+**Query strings are permitted.** They are a genuine exfiltration channel
+(`?dump=<secret>` is a write disguised as a read), and blocking them was tried
+and reverted: too many real endpoints need them. The accepted position is that
+council can exfiltrate via a GET query exactly like `curl` can, and the
+mitigation is **provenance, not prevention** — every fetch is recorded in the
+run's `.research.json` with its full URL, so an attempt is auditable after the
+fact. Read the audit trail if you care what was fetched.
+
+Refused, because none has a legitimate server-side use:
+
+| refused | why |
+|---|---|
+| `#fragment` | never transmitted to a server; only useful for hiding something in a logged URL |
+| `user:pw@host` | replays a secret the model should not hold, and lands verbatim in the log |
+| non-`http(s)` schemes | `file://`, `data:` etc. are not fetches |
+
+Enforced on the caller's URL **and on every redirect hop**, since a redirect
+target is chosen by the remote server.
+
+There is no code path that sends a request body, a custom header, or any method
+other than GET.
+
+**Do not expose `fetch_url` to untrusted callers or untrusted URL content.** With
+query strings allowed, a prompt-injected URL is an exfiltration primitive.
+
+#### URL cache
+
+Fetched pages are cached for 10 minutes and shared across the whole
+deliberation, so a panel reading the same spec costs **one** request:
+
+```bash
+council ask "..." --web --cache-ttl 600    # default; 0 disables
+```
+
+The important part is **single-flight de-duplication**. A plain check-then-fill
+cache does not help here: four members starting concurrently all miss, all
+fetch, and the cache only benefits a fifth request that never comes. Each URL
+gets its own lock held across the fetch, so concurrent readers of the same URL
+queue behind one real request. Measured: two members fetching the same URL
+simultaneously produce exactly one upstream hit.
+
+- Cache hits pay **no** politeness delay and consume **no** host budget — they
+  never touch the network.
+- Hits are disclosed to the model (`(from cache: ...)`) so a panellist can say
+  so if freshness matters to its argument.
+- Failures are shared with peers already queued on the same URL for 5 seconds,
+  then retried. Without that window a 30s timeout costs N fetches and N budget
+  units — one per waiting member — instead of one of each.
+- Entries are capped (256) with expiry-first eviction. TTL governs *freshness*,
+  not retention, so without a cap a model naming unlimited URLs across unlimited
+  hosts would grow memory unbounded; the per-host budget does not help because
+  each new host gets its own.
+- Keyed on the full URL, so distinct paths on one host are distinct entries.
+
+#### Not implemented, and why
+
+- **`robots.txt`** — RFC 9309 governs automated crawling, not a user asking for
+  one page. Required before any recursive or bulk fetching.
+- **Conditional GET** (`ETag`/`If-Modified-Since`) — cosmetic against a
+  run-scoped 10-minute cache.
+- **429/`Retry-After` backoff** — worth adding, not yet done.
+#### Data-egress policy
+
+Local addresses are **deliberately reachable** — a panellist reading a service on
+`localhost` or the LAN is a feature, and a local MCP subprocess adds no privilege
+its parent did not already have. The control is on what a request can **carry**,
+not where it can point:
+
+| refused | why |
+|---|---|
+| `?anything=...` | a GET query is a write channel: `?dump=<secret>` exfiltrates without a POST |
+| `#fragment` | same, and never needed server-side |
+| `user:pw@host` | an egress channel, and replays a secret the model should not hold |
+| non-`http(s)` schemes | `file://`, `data:` etc. are not fetches |
+
+A GET with no query, no fragment and no credentials can only *name* a resource.
+That invariant is enforced on the caller's URL **and on every redirect hop**,
+since a redirect target is chosen by the remote server and could otherwise
+append `?secret=...` to an allowed host.
+
+Not implemented: request bodies, custom headers, or any non-GET method. There is
+no code path that sends one.
 
 Every lookup is recorded in the transcript, so you can see what a claim was
 based on:
@@ -456,7 +538,7 @@ If you extend this crate, keep the lints on. They pay for themselves.
 
 ## Verification
 
-13 unit tests plus 179 ad-hoc checks across six harnesses, run against fake in-process SSE servers
+20 unit tests plus 197 ad-hoc checks across seven harnesses, run against fake in-process SSE servers
 (no tokens spent):
 
 - **OpenAI path (32):** full 3-round × 3-member run, request accounting, round-1
@@ -466,6 +548,10 @@ If you extend this crate, keep the lints on. They pay for themselves.
 - **Anthropic path (19):** wire shape, custom auth headers, `${ENV}` expansion,
   `thinking_delta` exclusion, the zero-text failure mode, truncation detection,
   partial-panel degradation.
+- **URL policy (18):** local/private addresses reachable, query strings
+  permitted and preserved verbatim, fragments and credentials and non-http
+  schemes refused before any socket opens, and a redirect to a blocked shape
+  refused at the hop while plain and query-bearing redirects still resolve.
 - **Provenance & audit (27):** a `.research.json` per member, full results
   retained rather than summary lines, arguments verbatim, failed lookups flagged
   and counted, the `audit` subcommand's output and flags, and graceful handling

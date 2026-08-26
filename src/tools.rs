@@ -557,9 +557,7 @@ impl Toolbox {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("fetch_url needs a 'url'"))?;
         let url = Url::parse(raw.trim()).map_err(|e| anyhow::anyhow!("bad url: {e}"))?;
-        if !matches!(url.scheme(), "http" | "https") {
-            bail!("only http(s) URLs are allowed (got '{}')", url.scheme());
-        }
+        check_no_data_egress(&url)?;
 
         // Cache on the normalised URL so trivial spelling differences still hit.
         let key = url.as_str().to_owned();
@@ -664,9 +662,11 @@ impl Toolbox {
                 let next = url
                     .join(location)
                     .map_err(|e| anyhow::anyhow!("bad redirect target '{location}': {e}"))?;
-                if !matches!(next.scheme(), "http" | "https") {
-                    bail!("redirect to non-http(s) scheme '{}' refused", next.scheme());
-                }
+                // A redirect target is chosen by the remote server, so it gets
+                // the same scrutiny as a caller-supplied URL - otherwise a
+                // permitted host could bounce us to `?secret=...`.
+                check_no_data_egress(&next)
+                    .map_err(|e| anyhow::anyhow!("refusing redirect to '{location}': {e}"))?;
                 if hop == MAX_HOPS {
                     bail!("too many redirects (>{MAX_HOPS})");
                 }
@@ -687,6 +687,41 @@ impl Toolbox {
         bail!("too many redirects (>{MAX_HOPS})")
     }
 }
+
+/// Reject URLs that are not fetches at all, or that carry credentials.
+///
+/// Deliberately NOT blocked:
+///
+/// * **Local and private addresses.** A panellist reading `localhost`, the LAN,
+///   or a metadata endpoint is a feature. A local MCP subprocess adds no
+///   privilege its parent did not already have.
+/// * **Query strings.** They are a real exfiltration channel (`?dump=<secret>`
+///   is a write disguised as a read), but they are also how a large share of
+///   useful endpoints work, so blocking them broke more than it protected. The
+///   accepted position: council can exfiltrate via a GET query exactly like
+///   `curl` can, and the mitigation is that every fetch is recorded in the run's
+///   provenance with its full URL - an attempt is *auditable after the fact*
+///   rather than prevented. Do not expose `fetch_url` to untrusted callers or
+///   untrusted URL content on that basis.
+///
+/// What remains blocked has no legitimate server-side use:
+fn check_no_data_egress(url: &Url) -> Result<()> {
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("only http(s) URLs are allowed (got '{}')", url.scheme());
+    }
+    // Fragments are never transmitted to a server, so a fragment in a fetch is
+    // either a mistake or an attempt to hide something in a logged URL.
+    if let Some(frag) = url.fragment() {
+        bail!("URL fragments are not allowed (got '#{frag}'); request the plain URL");
+    }
+    // Credentials in a URL replay a secret the model should never hold, and land
+    // verbatim in the provenance log.
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("credentials in the URL are not allowed");
+    }
+    Ok(())
+}
+
 /// Rate-limit bucket key for a URL: `scheme://host:port`.
 ///
 /// A real origin, parsed by `url::Url` rather than string-splitting. The previous
@@ -798,6 +833,88 @@ mod tests {
 
     /// The old string-splitting `host_of` collapsed every IPv6 address into one
     /// bucket. These cases exist so that regression cannot come back silently.
+    /// Local addresses are ALLOWED by design (a panellist reading a service on
+    /// localhost is a feature, and a local MCP subprocess adds no privilege).
+    /// What is blocked is a request that could carry data OUT.
+    #[test]
+    fn local_addresses_are_permitted() {
+        for u in [
+            "http://127.0.0.1:8080/metrics",
+            "http://localhost:3000/health",
+            "http://10.0.0.231:8080/co2",
+            "http://192.168.1.1/status",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:8080/x",
+        ] {
+            let url = Url::parse(u).expect("parse");
+            assert!(
+                check_no_data_egress(&url).is_ok(),
+                "local/private addresses must remain fetchable: {u}"
+            );
+        }
+    }
+
+    /// Query strings are ALLOWED: too many real endpoints need them, and the
+    /// mitigation is provenance (every fetch is logged with its full URL), not
+    /// prevention. This test pins the decision so it is not silently reversed.
+    #[test]
+    fn query_strings_are_permitted() {
+        for u in [
+            "https://api.example/v1/search?q=rust&limit=10",
+            "http://127.0.0.1:8080/metrics?format=prometheus",
+            "https://ok.example/page?",
+        ] {
+            let url = Url::parse(u).expect("parse");
+            assert!(
+                check_no_data_egress(&url).is_ok(),
+                "query strings must remain usable: {u}"
+            );
+        }
+    }
+
+    #[test]
+    fn fragments_and_credentials_are_refused() {
+        for (u, want) in [
+            ("https://ok.example/page#SECRET", "fragment"),
+            ("https://user:pw@ok.example/page", "credentials"),
+            ("https://user@ok.example/page", "credentials"),
+        ] {
+            let url = Url::parse(u).expect("parse");
+            let err = check_no_data_egress(&url).expect_err("must refuse");
+            assert!(
+                format!("{err:#}").to_lowercase().contains(want),
+                "expected '{want}' in: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_http_schemes_are_refused() {
+        for u in [
+            "file:///etc/passwd",
+            "ftp://x.example/f",
+            "data:text/html,hi",
+        ] {
+            let url = Url::parse(u).expect("parse");
+            assert!(
+                check_no_data_egress(&url).is_err(),
+                "only http(s) should be allowed: {u}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_urls_are_allowed() {
+        for u in [
+            "https://docs.rs/reqwest/latest/reqwest/",
+            "http://example.com",
+            "https://example.com/a/b/c.html",
+        ] {
+            let url = Url::parse(u).expect("parse");
+            assert!(check_no_data_egress(&url).is_ok(), "should allow: {u}");
+        }
+    }
+
     #[test]
     fn origin_of_handles_ipv6_ports_and_case() {
         let cases = [

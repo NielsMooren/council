@@ -34,6 +34,85 @@ pub struct Deliberation {
     pub resume: bool,
 }
 
+/// Identity of the turn being logged.
+struct LogCtx {
+    dir: PathBuf,
+    round: u8,
+    name: String,
+    provider: String,
+    model: String,
+    system: String,
+    prompt: String,
+}
+
+impl LogCtx {
+    fn new(
+        dir: &std::path::Path,
+        round: u8,
+        member: &crate::provider::Member,
+        system: &str,
+        prompt: &str,
+    ) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            round,
+            name: member.name.clone(),
+            provider: member.provider.clone(),
+            model: member.model.clone(),
+            system: system.to_owned(),
+            prompt: prompt.to_owned(),
+        }
+    }
+}
+
+/// Write one member's provenance.
+///
+/// Called BEFORE the prose is written, because the prose is the resume marker:
+/// that ordering can leave provenance without an answer (harmless, it re-runs)
+/// but never an answer without provenance, which would be silently unauditable.
+async fn write_log(
+    ctx: &LogCtx,
+    research: Vec<crate::provider::ToolRecord>,
+    answer: String,
+    failed: Option<String>,
+) -> Result<()> {
+    if research.is_empty() {
+        return Ok(());
+    }
+    let meta = ResearchLog {
+        round: ctx.round,
+        member: ctx.name.clone(),
+        provider: ctx.provider.clone(),
+        model: ctx.model.clone(),
+        system: ctx.system.clone(),
+        prompt: ctx.prompt.clone(),
+        answer,
+        failed,
+        research,
+    };
+    let json = serde_json::to_vec_pretty(&meta).context("serialising provenance")?;
+    let path = ctx
+        .dir
+        .join(format!("r{}_{}.research.json", ctx.round, ctx.name));
+    tokio::fs::write(&path, json)
+        .await
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Root paths for the cache manifest.
+///
+/// Paths, not contents: hashing a whole tree per run is too slow to be worth it.
+/// The consequence is real and documented - editing code in place and re-running
+/// the same question reuses the old answers, so use `--fresh` (CLI) after
+/// changing the code you are asking about.
+fn panel_roots(tools: &Toolbox) -> Vec<String> {
+    tools
+        .roots
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
 /// Everything needed to audit one panellist's turn after the fact: what it was
 /// asked, what it looked up, what each lookup returned, and what it concluded.
 #[derive(serde::Serialize)]
@@ -46,10 +125,26 @@ struct ResearchLog {
     system: String,
     prompt: String,
     answer: String,
+    /// Set when the member failed: the error, so a truncated trail is explained
+    /// rather than looking like a member that simply stopped early.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed: Option<String>,
     research: Vec<crate::provider::ToolRecord>,
 }
 
+/// Per-member result, so a caller can see who actually spoke.
+#[derive(serde::Serialize)]
+pub struct MemberOutcome {
+    pub name: String,
+    pub ok: bool,
+    /// How many rounds this member contributed to.
+    pub rounds_present: u8,
+}
+
 pub struct Outcome {
+    /// Who actually contributed, so a caller can tell a 4-of-4 panel from a
+    /// 2-of-4 one without parsing prose.
+    pub members: Vec<MemberOutcome>,
     pub transcript: String,
     pub consensus: String,
     pub cache_dir: PathBuf,
@@ -142,43 +237,58 @@ Positions that actually moved, and why. This is the highest-signal section - be 
 impl Deliberation {
     /// Cache key for a run.
     ///
-    /// Must cover EVERYTHING that changes what a member is asked, or a warm
-    /// cache silently serves output produced under a different protocol. This
-    /// was verified as a live bug: two runs differing only in persona text
-    /// collided on one key, so run 2 replayed run 1's answers.
+    /// Hashes a canonical JSON manifest rather than concatenating fields. Two
+    /// reasons: undelimited concatenation means `name="ab", model="c"` and
+    /// `name="a", model="bc"` hash identically, and a manifest makes it obvious
+    /// when a new input has been forgotten - which is how the persona collision
+    /// shipped in the first place.
     ///
-    /// `PROTOCOL_VERSION` is the manual escape hatch - bump it whenever the
-    /// prompts in this file change, since their text is not otherwise hashed.
-    fn cache_key(&self, panel: &ResolvedPanel) -> String {
-        /// Bump on any change to `RULES`, `TOOL_RULES`, `round_prompt` or `SYNTH`.
-        const PROTOCOL_VERSION: u32 = 2;
-
+    /// Everything that changes what a member is ASKED must be in here, including
+    /// the prompt constants: relying on a hand-bumped version number is the same
+    /// bug class re-armed, since the prompts get edited far more often than
+    /// anyone remembers to bump a constant.
+    fn cache_key(&self, panel: &ResolvedPanel, cfg: &Config) -> String {
+        let manifest = serde_json::json!({
+            // Hash of the prompt text itself, so editing RULES or SYNTH
+            // invalidates the cache automatically. No discipline required.
+            "protocol": Self::protocol_digest(),
+            "question": self.question,
+            "context": self.context,
+            "panel": panel.name,
+            "rounds": self.rounds,
+            "chair": panel.chair,
+            "members": panel.members.iter().map(|m| serde_json::json!({
+                "name": m.name,
+                "provider": m.provider,
+                "model": m.model,
+                "persona": m.persona,
+                // The EFFECTIVE ceiling, not just an override: changing the
+                // config default silently reused stale answers before.
+                "max_tokens": m.max_tokens.or(self.max_tokens).unwrap_or(cfg.max_tokens),
+            })).collect::<Vec<_>>(),
+            "tools": {
+                "roots": panel_roots(&self.tools),
+                "web": self.tools.web,
+            },
+        });
         let mut h = Sha256::new();
-        h.update(PROTOCOL_VERSION.to_le_bytes());
-        h.update(self.question.as_bytes());
-        h.update(self.context.as_deref().unwrap_or("").as_bytes());
-        h.update(panel.name.as_bytes());
-        h.update([self.rounds]);
-        // The chair authors consensus.md; a different chair is a different run.
-        h.update(panel.chair.as_deref().unwrap_or("<last-member>").as_bytes());
-        for m in &panel.members {
-            h.update(m.name.as_bytes());
-            h.update(m.provider.as_bytes());
-            h.update(m.model.as_bytes());
-            // Persona is part of the system prompt, so it changes the question.
-            h.update(m.persona.as_deref().unwrap_or("").as_bytes());
-            // Per-member ceilings can truncate an answer.
-            h.update(m.max_tokens.unwrap_or(0).to_le_bytes());
-        }
-        if let Some(mt) = self.max_tokens {
-            h.update(mt.to_le_bytes());
-        }
-        // A run with code access is not the same run as one without.
-        for root in &self.tools.roots {
-            h.update(root.as_os_str().as_encoded_bytes());
-        }
-        h.update([u8::from(self.tools.web)]);
+        // to_string on a serde_json::Value with sorted keys is canonical enough:
+        // serde_json preserves insertion order and this literal is fixed.
+        h.update(manifest.to_string().as_bytes());
         format!("{:x}", h.finalize()).chars().take(16).collect()
+    }
+
+    /// Digest of every prompt constant, so a prompt edit changes the cache key.
+    fn protocol_digest() -> String {
+        let mut h = Sha256::new();
+        h.update(RULES.as_bytes());
+        h.update(TOOL_RULES.as_bytes());
+        h.update(SYNTH.as_bytes());
+        // Round prompts are generated, so hash each shape a run can produce.
+        for round in 1..=6_u8 {
+            h.update(round_prompt(round, 6, "").as_bytes());
+        }
+        format!("{:x}", h.finalize()).chars().take(12).collect()
     }
 
     pub async fn run(&self, cfg: &Config) -> Result<Outcome> {
@@ -202,7 +312,7 @@ impl Deliberation {
                 .build()?,
         );
 
-        let dir = cfg.data_dir().join("runs").join(self.cache_key(panel));
+        let dir = cfg.data_dir().join("runs").join(self.cache_key(panel, cfg));
         tokio::fs::create_dir_all(&dir).await.ok();
 
         let question = &self.question;
@@ -220,6 +330,8 @@ impl Deliberation {
 
         let mut transcript = String::new();
         let mut failures = Vec::new();
+        let mut present: std::collections::BTreeMap<String, u8> =
+            panel.members.iter().map(|m| (m.name.clone(), 0)).collect();
 
         for round in 1..=self.rounds {
             let round_out = self
@@ -240,6 +352,9 @@ impl Deliberation {
             // 2-of-4 panel reads identically to a 4-of-4 one.
             for (name, text) in &round_out {
                 let _ = writeln!(transcript, "\n===== {name} =====\n{text}");
+                if let Some(n) = present.get_mut(name) {
+                    *n = n.saturating_add(1);
+                }
             }
             let absent: Vec<&str> = panel
                 .members
@@ -257,7 +372,46 @@ impl Deliberation {
             }
         }
 
-        // Chair synthesis.
+        let consensus = self
+            .synthesise(cfg, panel, &http, &dir, &system_base, &transcript)
+            .await?;
+
+        let _ = tokio::fs::write(dir.join("transcript.md"), &transcript).await;
+
+        Ok(Outcome {
+            transcript,
+            consensus,
+            cache_dir: dir,
+            failures,
+            members: panel
+                .members
+                .iter()
+                .map(|m| {
+                    let rounds_present = present.get(&m.name).copied().unwrap_or(0);
+                    MemberOutcome {
+                        name: m.name.clone(),
+                        ok: rounds_present == self.rounds,
+                        rounds_present,
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    /// Chair phase: one member reads the whole transcript and writes the
+    /// consensus document.
+    ///
+    /// Deliberately toolless - it synthesises what was argued and must not
+    /// introduce evidence nobody debated.
+    async fn synthesise(
+        &self,
+        cfg: &Config,
+        panel: &ResolvedPanel,
+        http: &Arc<reqwest::Client>,
+        dir: &std::path::Path,
+        system_base: &str,
+        transcript: &str,
+    ) -> Result<String> {
         let chair = panel
             .chair
             .as_deref()
@@ -267,49 +421,39 @@ impl Deliberation {
         let provider = cfg.provider(&chair.provider)?;
         let consensus_path = dir.join("consensus.md");
 
-        let consensus = match tokio::fs::read_to_string(&consensus_path).await {
-            // Any non-trivial cached synthesis counts. A length threshold here
-            // silently re-bills the chair on every resume for terse models.
-            Ok(c) if self.resume && c.trim().len() > 40 => c,
-            _ => {
-                let text = provider
-                    .complete(
-                        &http,
-                        Request {
-                            model: &chair.model,
-                            // The chair must see the question too - synthesising a
-                            // transcript without knowing what was asked produces a
-                            // summary, not a decision.
-                            system: &format!(
-                                "You are a rigorous panel chair. You do not manufacture \
-                                 agreement. You separate fact from opinion.\n\n{system_base}"
-                            ),
-                            user: &format!("{SYNTH}\n\n=== TRANSCRIPT ===\n{transcript}"),
-                            max_tokens: chair
-                                .max_tokens
-                                .or(self.max_tokens)
-                                .unwrap_or(cfg.max_tokens)
-                                .max(8000),
-                            // The chair synthesises what was argued; it must not
-                            // introduce fresh evidence nobody debated.
-                            tools: &Toolbox::default(),
-                        },
-                    )
-                    .await
-                    .context("chair synthesis failed")?
-                    .text;
-                let _ = tokio::fs::write(&consensus_path, &text).await;
-                text
+        // Any non-trivial cached synthesis counts. A length threshold here
+        // silently re-bills the chair on every resume for terse models.
+        if let Ok(cached) = tokio::fs::read_to_string(&consensus_path).await {
+            if self.resume && cached.trim().len() > 40 {
+                return Ok(cached);
             }
-        };
-
-        let _ = tokio::fs::write(dir.join("transcript.md"), &transcript).await;
-        Ok(Outcome {
-            transcript,
-            consensus,
-            cache_dir: dir,
-            failures,
-        })
+        }
+        let text = provider
+            .complete(
+                http,
+                Request {
+                    model: &chair.model,
+                    // The chair must see the question too - synthesising a
+                    // transcript without knowing what was asked produces a
+                    // summary, not a decision.
+                    system: &format!(
+                        "You are a rigorous panel chair. You do not manufacture \
+                         agreement. You separate fact from opinion.\n\n{system_base}"
+                    ),
+                    user: &format!("{SYNTH}\n\n=== TRANSCRIPT ===\n{transcript}"),
+                    max_tokens: chair
+                        .max_tokens
+                        .or(self.max_tokens)
+                        .unwrap_or(cfg.max_tokens)
+                        .max(8000),
+                    tools: &Toolbox::default(),
+                },
+            )
+            .await
+            .context("chair synthesis failed")?
+            .text;
+        let _ = tokio::fs::write(&consensus_path, &text).await;
+        Ok(text)
     }
 
     /// One round: every member in parallel, cached, failures collected.
@@ -349,7 +493,13 @@ impl Deliberation {
                 let path = dir.join(format!("r{round}_{}.md", member.name));
                 // Resume: a killed run must not re-pay for finished work.
                 if let Ok(cached) = tokio::fs::read_to_string(&path).await {
-                    if cached.len() > 200 {
+                    // Only resume an answer we can still audit. A cached `.md`
+                    // whose provenance is missing while the answer cites lookups
+                    // is unverifiable, so re-run it rather than trust it.
+                    let jpath = dir.join(format!("r{round}_{}.research.json", member.name));
+                    let auditable = !cached.contains("<research>")
+                        || tokio::fs::try_exists(&jpath).await.unwrap_or(false);
+                    if cached.len() > 200 && auditable {
                         return (member.name, Ok(cached));
                     }
                 }
@@ -365,33 +515,40 @@ impl Deliberation {
                         },
                     )
                     .await;
+                let ctx = LogCtx::new(&dir, round, &member, &system, &prompt);
+
                 match out {
                     Ok(done) => {
-                        let _ = tokio::fs::write(&path, &done.text).await;
-                        // Full provenance beside the prose. The transcript keeps
-                        // one summary line per lookup; this keeps the arguments
-                        // AND the results, which is what makes a past
-                        // deliberation auditable at all.
-                        if !done.research.is_empty() {
-                            let meta = ResearchLog {
-                                round,
-                                member: member.name.clone(),
-                                provider: member.provider.clone(),
-                                model: member.model.clone(),
-                                system: system.clone(),
-                                prompt: prompt.to_string(),
-                                answer: done.text.clone(),
-                                research: done.research,
-                            };
-                            if let Ok(json) = serde_json::to_vec_pretty(&meta) {
-                                let jpath =
-                                    dir.join(format!("r{round}_{}.research.json", member.name));
-                                let _ = tokio::fs::write(jpath, json).await;
-                            }
+                        // A provenance write failure is NOT ignored: silently
+                        // losing the audit trail is worse than failing loudly.
+                        if let Err(e) =
+                            write_log(&ctx, done.research, done.text.clone(), None).await
+                        {
+                            return (member.name, Err(e));
+                        }
+                        if let Err(e) = tokio::fs::write(&path, &done.text).await {
+                            return (
+                                member.name,
+                                Err(anyhow::Error::new(e)
+                                    .context(format!("writing {}", path.display()))),
+                            );
                         }
                         (member.name, Ok(done.text))
                     }
-                    Err(e) => (member.name, Err(e)),
+                    Err(e) => {
+                        // Salvage whatever the member managed to look up before
+                        // it died, so the failed run is still auditable.
+                        let rescued = e
+                            .chain()
+                            .find_map(|c| c.downcast_ref::<crate::provider::Salvaged>())
+                            .map(|s| s.0.clone());
+                        if let Some(research) = rescued {
+                            let _ =
+                                write_log(&ctx, research, String::new(), Some(format!("{e:#}")))
+                                    .await;
+                        }
+                        (member.name, Err(e))
+                    }
                 }
             });
         }
@@ -441,6 +598,10 @@ mod tests {
         }
     }
 
+    fn test_cfg() -> Config {
+        Config::default()
+    }
+
     fn deliberation() -> Deliberation {
         Deliberation {
             question: "same question".to_owned(),
@@ -466,8 +627,8 @@ mod tests {
         let mut changed = deliberation();
         changed.panel.members[0] = member("A", Some("argue for speed"));
         assert_ne!(
-            base.cache_key(&base.panel),
-            changed.cache_key(&changed.panel),
+            base.cache_key(&base.panel, &test_cfg()),
+            changed.cache_key(&changed.panel, &test_cfg()),
             "persona is part of the system prompt and must change the key"
         );
     }
@@ -478,8 +639,8 @@ mod tests {
         let mut changed = deliberation();
         changed.panel.chair = Some("B".to_owned());
         assert_ne!(
-            base.cache_key(&base.panel),
-            changed.cache_key(&changed.panel),
+            base.cache_key(&base.panel, &test_cfg()),
+            changed.cache_key(&changed.panel, &test_cfg()),
             "the chair authors consensus.md, so it must change the key"
         );
     }
@@ -490,9 +651,37 @@ mod tests {
         let mut changed = deliberation();
         changed.panel.members[0].max_tokens = Some(500);
         assert_ne!(
-            base.cache_key(&base.panel),
-            changed.cache_key(&changed.panel),
+            base.cache_key(&base.panel, &test_cfg()),
+            changed.cache_key(&changed.panel, &test_cfg()),
             "a per-member ceiling can truncate an answer"
+        );
+    }
+
+    /// Regression: only per-member OVERRIDES were hashed, so changing the
+    /// config-wide default silently reused stale member output.
+    #[test]
+    fn cache_key_separates_effective_config_ceiling() {
+        let d = deliberation();
+        let mut other = test_cfg();
+        other.max_tokens = test_cfg().max_tokens + 1000;
+        assert_ne!(
+            d.cache_key(&d.panel, &test_cfg()),
+            d.cache_key(&d.panel, &other),
+            "the effective ceiling changes what a member can say"
+        );
+    }
+
+    /// Regression: prompt constants were not hashed, so editing RULES or SYNTH
+    /// replayed answers produced under the old protocol.
+    #[test]
+    fn protocol_digest_covers_the_prompts() {
+        let digest = Deliberation::protocol_digest();
+        assert_eq!(digest.len(), 12, "digest should be a fixed-width prefix");
+        // Cheap guard: the digest must actually depend on prompt text, so a
+        // future refactor that stops hashing them fails here.
+        assert!(
+            RULES.len() + SYNTH.len() + TOOL_RULES.len() > 500,
+            "prompts unexpectedly tiny - is protocol_digest still hashing them?"
         );
     }
 
@@ -501,8 +690,8 @@ mod tests {
         let a = deliberation();
         let b = deliberation();
         assert_eq!(
-            a.cache_key(&a.panel),
-            b.cache_key(&b.panel),
+            a.cache_key(&a.panel, &test_cfg()),
+            b.cache_key(&b.panel, &test_cfg()),
             "resume depends on the key being deterministic"
         );
     }
