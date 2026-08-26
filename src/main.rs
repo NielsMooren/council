@@ -39,8 +39,20 @@ enum Cmd {
         /// Extra context; `-` reads stdin.
         #[arg(short = 'x', long)]
         context: Option<String>,
-        #[arg(short, long, default_value = "default")]
-        panel: String,
+        /// Pick the council at runtime from the model registry:
+        /// `--with opus,sol,haiku`. Also accepts `Alias=model` to rename and
+        /// `provider:model` for something not in the registry. Overrides --panel.
+        #[arg(short = 'w', long, value_delimiter = ',')]
+        with: Vec<String>,
+        /// Which member writes the synthesis. Defaults to the last.
+        #[arg(long)]
+        chair: Option<String>,
+        /// Per-member token ceiling for this run.
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// Named panel from config. Ignored when --with is given.
+        #[arg(short, long)]
+        panel: Option<String>,
         #[arg(short, long, default_value_t = 3)]
         rounds: u8,
         /// Print the full transcript too.
@@ -52,6 +64,8 @@ enum Cmd {
     },
     /// Show panels, providers, and whether each API key is present.
     Panels,
+    /// List the model registry: the handles `--with` accepts.
+    Models,
     /// Verify config parses and every referenced provider has a key.
     Check,
 }
@@ -75,17 +89,29 @@ async fn main() -> Result<()> {
         Cmd::Ask {
             question,
             context,
+            with,
+            chair,
+            max_tokens,
             panel,
             rounds,
             transcript,
             fresh,
         } => {
-            ask(
-                cli.config, question, context, panel, rounds, transcript, fresh,
-            )
-            .await?;
+            let opts = AskOpts {
+                question,
+                context,
+                with,
+                chair,
+                max_tokens,
+                panel,
+                rounds,
+                transcript,
+                fresh,
+            };
+            ask(cli.config.as_deref(), opts).await?;
         }
         Cmd::Panels => panels(cli.config.as_deref())?,
+        Cmd::Models => models(cli.config.as_deref())?,
         Cmd::Check => check(cli.config.as_deref())?,
     }
     Ok(())
@@ -114,17 +140,29 @@ fn init(config: Option<PathBuf>, force: bool) -> Result<()> {
     Ok(())
 }
 
-async fn ask(
-    config: Option<PathBuf>,
+/// CLI options for `ask`, grouped so the function stays under the arg limit.
+struct AskOpts {
     question: String,
     context: Option<String>,
-    panel: String,
+    with: Vec<String>,
+    chair: Option<String>,
+    max_tokens: Option<u32>,
+    panel: Option<String>,
     rounds: u8,
-    show_transcript: bool,
+    transcript: bool,
     fresh: bool,
-) -> Result<()> {
-    let cfg = Config::load(config.as_deref())?;
-    let context = match context.as_deref() {
+}
+
+async fn ask(config: Option<&std::path::Path>, o: AskOpts) -> Result<()> {
+    let cfg = Config::load(config)?;
+    // --with wins: an explicit runtime roster overrides any named panel.
+    let panel = if o.with.is_empty() {
+        cfg.named_panel(o.panel.as_deref())?
+    } else {
+        cfg.panel_from_specs(&o.with, o.chair.as_deref())?
+    };
+
+    let context = match o.context.as_deref() {
         Some("-") => {
             use std::io::Read as _;
             let mut s = String::new();
@@ -133,17 +171,31 @@ async fn ask(
         }
         other => other.map(str::to_owned),
     };
+
+    let roster: Vec<String> = panel
+        .members
+        .iter()
+        .map(|m| format!("{} ({}:{})", m.name, m.provider, m.model))
+        .collect();
+    eprintln!(
+        "council: {} rounds x {} members [{}]",
+        o.rounds.clamp(1, 6),
+        panel.members.len(),
+        roster.join(", ")
+    );
+
     let out = Deliberation {
-        question,
+        question: o.question,
         context,
-        rounds: rounds.clamp(1, 6),
+        rounds: o.rounds.clamp(1, 6),
         panel,
-        resume: !fresh,
+        max_tokens: o.max_tokens,
+        resume: !o.fresh,
     }
     .run(&cfg)
     .await?;
 
-    if show_transcript {
+    if o.transcript {
         println!("{}\n", out.transcript);
     }
     println!("{}", out.consensus);
@@ -157,6 +209,23 @@ async fn ask(
     Ok(())
 }
 
+fn models(config: Option<&std::path::Path>) -> Result<()> {
+    let cfg = Config::load(config)?;
+    if cfg.models.is_empty() {
+        println!("registry is empty; add [[models]] entries to your config");
+        return Ok(());
+    }
+    println!("{:<14} {:<12} MODEL", "HANDLE", "PROVIDER");
+    for m in &cfg.models {
+        println!("{:<14} {:<12} {}", m.name, m.provider, m.model);
+    }
+    println!(
+        "\nuse with: council ask \"...\" --with {}",
+        cfg.model_names().join(",")
+    );
+    Ok(())
+}
+
 fn panels(config: Option<&std::path::Path>) -> Result<()> {
     let cfg = Config::load(config)?;
     for p in &cfg.panels {
@@ -165,8 +234,13 @@ fn panels(config: Option<&std::path::Path>) -> Result<()> {
             p.name,
             p.chair.as_deref().unwrap_or("last")
         );
-        for m in &p.members {
-            println!("  {:<14} {}:{}", m.name, m.provider, m.model);
+        match cfg.resolve(p) {
+            Ok(rp) => {
+                for m in &rp.members {
+                    println!("  {:<14} {}:{}", m.name, m.provider, m.model);
+                }
+            }
+            Err(e) => println!("  UNRESOLVABLE: {e}"),
         }
     }
     println!();

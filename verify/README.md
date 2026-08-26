@@ -6,8 +6,9 @@ are spent and no network access is needed.
 
 ```bash
 cargo build
-python3.11+ verify/openai_path.py       # 32 checks
-python3.11+ verify/anthropic_path.py    # 19 checks
+python3.11+ verify/openai_path.py        # 32 checks
+python3.11+ verify/anthropic_path.py     # 19 checks
+python3.11+ verify/runtime_selection.py  # 27 checks
 ```
 
 Override the binary with `COUNCIL_BIN=/path/to/council`.
@@ -20,5 +21,10 @@ config validation.
 `anthropic_path.py` covers the Anthropic wire shape, custom auth headers,
 `${ENV}` expansion, `thinking_delta` exclusion, the zero-text-response failure
 mode, truncation detection, and partial-panel degradation.
+
+`runtime_selection.py` covers the model registry and per-call selection:
+`--with` running exactly the chosen models, rounds driving the call count, chair
+selection, aliases, the `provider:model` escape hatch, validation failures
+before any API call, and the same knobs over MCP.
 
 Requires Python 3.11+ (`tomllib`).

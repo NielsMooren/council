@@ -8,7 +8,7 @@
 //!   Rn  commitment: a decision even when in the minority.
 //!   Chair synthesis, explicitly instructed not to fake consensus.
 
-use crate::config::{Config, Panel};
+use crate::config::{Config, ResolvedPanel};
 use crate::provider::Request;
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -21,7 +21,11 @@ pub struct Deliberation {
     pub question: String,
     pub context: Option<String>,
     pub rounds: u8,
-    pub panel: String,
+    /// The roster to run. Built either from a named config panel or from
+    /// runtime model handles - the engine does not care which.
+    pub panel: ResolvedPanel,
+    /// Per-member token ceiling, overriding config/registry defaults.
+    pub max_tokens: Option<u32>,
     /// Reuse cached member responses for an identical question+panel+round.
     pub resume: bool,
 }
@@ -100,7 +104,7 @@ What must not be done.
 Positions that actually moved, and why. This is the highest-signal section - be specific.";
 
 impl Deliberation {
-    fn cache_key(&self, panel: &Panel) -> String {
+    fn cache_key(&self, panel: &ResolvedPanel) -> String {
         let mut h = Sha256::new();
         h.update(self.question.as_bytes());
         h.update(self.context.as_deref().unwrap_or("").as_bytes());
@@ -108,13 +112,17 @@ impl Deliberation {
         h.update([self.rounds]);
         for m in &panel.members {
             h.update(m.name.as_bytes());
+            h.update(m.provider.as_bytes());
             h.update(m.model.as_bytes());
+        }
+        if let Some(mt) = self.max_tokens {
+            h.update(mt.to_le_bytes());
         }
         format!("{:x}", h.finalize()).chars().take(16).collect()
     }
 
     pub async fn run(&self, cfg: &Config) -> Result<Outcome> {
-        let panel = cfg.panel(&self.panel)?;
+        let panel = &self.panel;
         let http = Arc::new(
             reqwest::Client::builder()
                 // Successful streamed calls return in well under this. A request
@@ -182,7 +190,11 @@ impl Deliberation {
                                  agreement. You separate fact from opinion.\n\n{system_base}"
                             ),
                             user: &format!("{SYNTH}\n\n=== TRANSCRIPT ===\n{transcript}"),
-                            max_tokens: chair.max_tokens.unwrap_or(cfg.max_tokens).max(8000),
+                            max_tokens: chair
+                                .max_tokens
+                                .or(self.max_tokens)
+                                .unwrap_or(cfg.max_tokens)
+                                .max(8000),
                         },
                     )
                     .await
@@ -209,7 +221,7 @@ impl Deliberation {
     async fn run_round(
         &self,
         cfg: &Config,
-        panel: &Panel,
+        panel: &ResolvedPanel,
         http: &Arc<reqwest::Client>,
         dir: &std::path::Path,
         system_base: &str,
@@ -224,7 +236,10 @@ impl Deliberation {
             let (http, prompt, dir) = (http.clone(), prompt.clone(), dir.to_path_buf());
             let provider = cfg.provider(&member.provider)?.clone();
             let member = member.clone();
-            let max_tokens = member.max_tokens.unwrap_or(cfg.max_tokens);
+            let max_tokens = member
+                .max_tokens
+                .or(self.max_tokens)
+                .unwrap_or(cfg.max_tokens);
             let system = member.persona.as_ref().map_or_else(
                 || system_base.to_owned(),
                 |p| format!("{system_base}\n\n=== YOUR PERSPECTIVE ===\n{p}"),

@@ -18,9 +18,21 @@ pub struct DeliberateArgs {
     /// facts. Panellists know nothing beyond what you put here.
     #[serde(default)]
     pub context: Option<String>,
-    /// Panel name from config. Defaults to "default".
+    /// Named panel from config. Ignored when `with` is given.
     #[serde(default)]
     pub panel: Option<String>,
+    /// Pick the council at runtime from the model registry, e.g.
+    /// `["opus", "sol", "haiku"]`. Call `panels` to see the registry. Also
+    /// accepts `Alias=handle` to rename, or `provider:model` for an
+    /// unregistered model. Overrides `panel`.
+    #[serde(default)]
+    pub with: Option<Vec<String>>,
+    /// Which member writes the synthesis. Defaults to the last.
+    #[serde(default)]
+    pub chair: Option<String>,
+    /// Per-member token ceiling for this run.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     /// Rounds of debate. 1 = independent opinions only (no cross-talk),
     /// 3 = opening/cross-examination/commitment (recommended), 4+ for hard calls.
     #[serde(default)]
@@ -76,11 +88,21 @@ for factual lookups or tasks with a single correct answer."
     ) -> Result<String, ErrorData> {
         let cfg = self.cfg()?;
         let rounds = args.rounds.unwrap_or(3).clamp(1, 6);
+        let specs = args.with.unwrap_or_default();
+        // A runtime roster wins over any named panel.
+        let panel = if specs.is_empty() {
+            cfg.named_panel(args.panel.as_deref())
+        } else {
+            cfg.panel_from_specs(&specs, args.chair.as_deref())
+        }
+        .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
+
         let d = Deliberation {
             question: args.question,
             context: args.context,
             rounds,
-            panel: args.panel.unwrap_or_else(|| "default".into()),
+            panel,
+            max_tokens: args.max_tokens,
             resume: true,
         };
         let out = d
@@ -109,12 +131,26 @@ for factual lookups or tasks with a single correct answer."
     #[tool(description = "List the panels and providers available in the council config.")]
     pub async fn panels(&self) -> Result<String, ErrorData> {
         let cfg = self.cfg()?;
-        let mut s = String::from("## Panels\n");
+        let mut s = String::from("## Models (handles for `with`)\n");
+        for m in &cfg.models {
+            let _ = writeln!(s, "- `{}` — {}:{}", m.name, m.provider, m.model);
+        }
+        if cfg.models.is_empty() {
+            s.push_str("- (registry empty; add [[models]] to the config)\n");
+        }
+        s.push_str("\n## Panels\n");
         for p in &cfg.panels {
             let chair = p.chair.as_deref().unwrap_or("(last member)");
             let _ = writeln!(s, "\n### {} — chair: {chair}", p.name);
-            for m in &p.members {
-                let _ = writeln!(s, "- {} — {}:{}", m.name, m.provider, m.model);
+            match cfg.resolve(p) {
+                Ok(rp) => {
+                    for m in &rp.members {
+                        let _ = writeln!(s, "- {} — {}:{}", m.name, m.provider, m.model);
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(s, "- UNRESOLVABLE: {e}");
+                }
             }
         }
         s.push_str("\n## Providers\n");

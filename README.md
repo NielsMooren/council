@@ -52,25 +52,89 @@ Two tools appear:
 | `deliberate` | convene the panel on a question, return a consensus document |
 | `panels` | list configured panels and providers |
 
-`deliberate` takes `question` (required), plus optional `context`, `panel`,
-`rounds` (1–6, default 3), `include_transcript`.
+`deliberate` takes `question` (required) plus, all optional:
+
+| arg | effect |
+|---|---|
+| `context` | background the panel needs; they know nothing else |
+| `with` | pick the council at runtime, e.g. `["opus","sonnet","gpt"]` — overrides `panel` |
+| `panel` | a named roster from config |
+| `chair` | which member synthesises |
+| `rounds` | 1–6, default 3 |
+| `max_tokens` | per-member ceiling for this run |
+| `include_transcript` | return the full debate, not just the consensus |
+
+Call `panels` first to see the registry handles and rosters.
 
 **When to reach for it:** consequential, contestable decisions — architecture,
 risky trade-offs, plan review, "is this design sound". **When not to:** factual
 lookups or anything with one correct answer. You will pay N times for the same
 reply.
 
+## Choosing the council at runtime
+
+Register your models once, then pick who sits on the council per call.
+
+```bash
+council models                       # the handles you can use
+# HANDLE         PROVIDER     MODEL
+# gpt            openai       gpt-5.5
+# sonnet         anthropic    claude-sonnet-4-5
+# opus           anthropic    claude-opus-4-5
+
+council ask "Is event sourcing right here?" --with sonnet,gpt
+council ask "..." --with opus,sonnet,gpt --rounds 4 --chair opus
+council ask "..." --with Hawk=gpt,Dove=sonnet          # rename for the transcript
+council ask "..." --with sonnet,openai:gpt-4.1         # one-off, unregistered
+council ask "..." --with sonnet,gpt --max-tokens 4000  # cheaper run
+```
+
+`--with` overrides `--panel`. Everything is validated *before* the first API
+call, so an unknown handle, a chair who is not a member, or a one-member
+"panel" fails instantly rather than after two paid rounds.
+
+### Picking rounds
+
+| rounds | shape | use for |
+|---|---|---|
+| 1 | independent opinions, no cross-talk | a quick spread of views; cheapest |
+| 2 | + cross-examination | most decisions |
+| **3** | + commitment (**default**) | consequential calls |
+| 4–6 | more cross-examination | genuinely contested designs |
+
+Cost scales as `members × rounds + 1` (the `+1` is the chair). Two models at
+1 round is 3 calls; four models at 4 rounds is 17. Start small.
+
+### Efficiency
+
+- **Diversity beats size.** Two models from different vendors disagree more
+  usefully than three from one. The disagreement is the product.
+- **Runs resume.** Identical question + panel + rounds reuses cached responses
+  and issues zero calls. Re-run freely; add `--fresh` to force.
+- **Widen after you narrow.** Ask 2 models at 1 round first. If they already
+  agree, you are done. If they split, re-ask with more members and rounds.
+- **Cap output** with `--max-tokens` for exploratory runs.
+
 ## Use from the shell
 
 ```bash
-council ask "Is event sourcing right for this audit log?"
 council ask "Review this plan" -x "$(cat PLAN.md)" --rounds 4
 council ask "..." -x -               # read context from stdin
 council ask "..." --panel security --transcript
-council panels
+council models                       # the registry
+council panels                       # rosters + key presence
+council check                        # validate config
 ```
 
 ## Configuration
+
+Three layers, each referencing the one above by name:
+
+```
+[[providers]]  a wire endpoint + auth          "anthropic", "work-gateway"
+[[models]]     a named model on a provider     "opus", "sonnet", "gpt"
+[[panels]]     a reusable roster of models     "default", "security"
+```
 
 Providers describe a **wire protocol**, not a vendor — so any OpenAI- or
 Anthropic-compatible endpoint works: OpenAI, Anthropic, Azure, OpenRouter,
@@ -93,9 +157,22 @@ auth = { header = "api-key" }       # gateways love inventing their own header
 headers = { "anthropic-version" = "2023-06-01", "x-trace" = "${TRACE_ID}" }
 ```
 
-Panels mix providers deliberately, and members get **personas rather than model
-names** — peers should argue with the argument, not defer to whichever model
-sounds most authoritative.
+The **model registry** is what makes runtime selection ergonomic — name a model
+once, then refer to it by that handle everywhere:
+
+```toml
+[[models]]
+name = "opus"                       # the handle `--with` takes
+provider = "anthropic"
+model = "claude-opus-4-5"
+persona = "You weigh trade-offs and refuse to manufacture agreement."
+max_tokens = 16000                  # optional per-model ceiling
+```
+
+Panels are reusable rosters that reference the registry. They mix providers
+deliberately, and members get **personas rather than model names** — peers
+should argue with the argument, not defer to whichever model sounds most
+authoritative.
 
 ```toml
 [[panels]]
@@ -103,15 +180,13 @@ name = "default"
 chair = "Chair"
 
   [[panels.members]]
-  name = "Pragmatist"
-  provider = "openai"
-  model = "gpt-5.5"
+  model = "gpt"                     # registry handle
+  name = "Pragmatist"               # renamed for the transcript
   persona = "You optimise for what ships this week and holds in production."
 
   [[panels.members]]
+  model = "sonnet"
   name = "Skeptic"
-  provider = "anthropic"
-  model = "claude-sonnet-4-5"
   persona = "You hunt unverified assumptions. Demand evidence for load-bearing claims."
 ```
 
@@ -195,7 +270,7 @@ If you extend this crate, keep the lints on. They pay for themselves.
 
 ## Verification
 
-51 ad-hoc checks across two harnesses, run against fake in-process SSE servers
+78 ad-hoc checks across three harnesses, run against fake in-process SSE servers
 (no tokens spent):
 
 - **OpenAI path (32):** full 3-round × 3-member run, request accounting, round-1
@@ -205,6 +280,11 @@ If you extend this crate, keep the lints on. They pay for themselves.
 - **Anthropic path (19):** wire shape, custom auth headers, `${ENV}` expansion,
   `thinking_delta` exclusion, the zero-text failure mode, truncation detection,
   partial-panel degradation.
+- **Runtime selection (27):** registry discovery, `--with` running exactly the
+  chosen models, round count driving call count, chair selection, aliases, the
+  `provider:model` escape hatch, rejection of unknown handles / bad chairs /
+  one-member panels, `--with` overriding `--panel`, `--max-tokens`, and the same
+  knobs over MCP.
 
 `cargo clippy --all-targets` and `cargo fmt --check` are clean. There is no
 unit-test suite yet — the harnesses are the evidence, and they exercise the real
