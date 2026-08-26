@@ -68,6 +68,8 @@ sensibly without being told.
 | `chair` | which member synthesises |
 | `rounds` | 1–6, default 3 |
 | `max_tokens` | per-member ceiling for this run |
+| `code` | absolute dirs panellists may read/search (read-only) |
+| `web` | allow fetching specs/docs/upstream source |
 | `include_transcript` | return the full debate, not just the consensus |
 
 Call `models` first to discover handles; `panels` for ready-made rosters.
@@ -98,6 +100,58 @@ council ask "..." --with sonnet,gpt --max-tokens 4000  # cheaper run
 `--with` overrides `--panel`. Everything is validated *before* the first API
 call, so an unknown handle, a chair who is not a member, or a one-member
 "panel" fails instantly rather than after two paid rounds.
+
+### Letting the panel do its own research
+
+By default a panellist is text-only: it can reason about your question and
+whatever you pass as `context`, and nothing else. That means it *speculates*
+about code it cannot see. Give it tools instead:
+
+```bash
+# panellists may read and search these directories (read-only)
+council ask "Does our SSE parser corrupt multi-byte UTF-8 split across chunks?" \
+  --with sonnet,sol --code ./src
+
+# also allow fetching specs, docs, RFCs, upstream source
+council ask "Are we using the OAuth device flow correctly?" \
+  --with opus,sol --code ./src --web
+```
+
+Four read-only tools, offered only when you enable them:
+
+| tool | needs | what it does |
+|---|---|---|
+| `read_file` | `--code` | read a file, with line numbers and offset/limit |
+| `search_code` | `--code` | ripgrep the contents, returns `file:line` matches |
+| `list_files` | `--code` | glob the tree to orient before reading |
+| `fetch_url` | `--web` | HTTP GET, tags stripped |
+
+**There is no shell, no write path, and no way out of the roots.** Paths are
+rejected before touching disk if absolute or containing `..`, then
+canonicalised and re-checked so a symlink pointing outward is caught too.
+
+Every lookup is recorded in the transcript, so you can audit what a claim was
+actually based on:
+
+```
+<research>
+- search_code(pattern=from_utf8_lossy) -> provider.rs:303: // Buffer BYTES, not a String. (5 lines)
+- read_file(limit=145, offset=260, path=provider.rs) -> 260|    } (145 lines)
+- read_file(path=Cargo.toml) -> error: 'Cargo.toml' not found under any project root
+</research>
+```
+
+The prompts change too: panellists are told not to speculate about anything
+they can verify, to check a *peer's* load-bearing claims rather than accept
+them, and to cite `file:line`. Cross-examination gains an explicit
+"UNVERIFIED CLAIMS" heading.
+
+The **chair gets no tools** — it synthesises what was argued, and must not
+introduce evidence nobody debated.
+
+The tool loop is bounded at 12 rounds per panellist. If a member burns its
+budget and then fails to produce a summary, its findings are still reported
+rather than the member being dropped.
 
 ### Picking rounds
 
@@ -276,7 +330,7 @@ If you extend this crate, keep the lints on. They pay for themselves.
 
 ## Verification
 
-84 ad-hoc checks across three harnesses, run against fake in-process SSE servers
+111 ad-hoc checks across four harnesses, run against fake in-process SSE servers
 (no tokens spent):
 
 - **OpenAI path (32):** full 3-round × 3-member run, request accounting, round-1
@@ -286,6 +340,11 @@ If you extend this crate, keep the lints on. They pay for themselves.
 - **Anthropic path (19):** wire shape, custom auth headers, `${ENV}` expansion,
   `thinking_delta` exclusion, the zero-text failure mode, truncation detection,
   partial-panel degradation.
+- **Research tools (27):** tools off by default, `--code`/`--web` gating, the
+  agentic loop on both wire formats (including fragmented tool arguments),
+  sandbox escapes refused (absolute paths, `..`, nested traversal), tool errors
+  handed back to the model rather than aborting, the loop being bounded, the
+  audit trail, and cache-key separation for tool-enabled runs.
 - **Runtime selection (33):** registry discovery, `--with` running exactly the
   chosen models, round count driving call count, chair selection, aliases, the
   `provider:model` escape hatch, rejection of unknown handles / bad chairs /

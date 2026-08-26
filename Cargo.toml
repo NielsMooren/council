@@ -2,7 +2,8 @@
 name = "council"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.87: `const fn` with the trait bounds clippy::missing_const_for_fn wants.
+rust-version = "1.87"
 description = "Multi-model deliberation panel as an MCP server: several LLMs debate a question across rounds, then a chair synthesises consensus."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NielsMooren/council"

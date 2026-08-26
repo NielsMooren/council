@@ -2,8 +2,9 @@ mod config;
 mod deliberate;
 mod mcp;
 mod provider;
+mod tools;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
 use deliberate::Deliberation;
@@ -50,6 +51,13 @@ enum Cmd {
         /// Per-member token ceiling for this run.
         #[arg(long)]
         max_tokens: Option<u32>,
+        /// Let panellists READ and SEARCH these directories to answer their own
+        /// questions instead of speculating. Repeatable. Read-only.
+        #[arg(long = "code", value_name = "DIR")]
+        code: Vec<PathBuf>,
+        /// Let panellists fetch URLs (specs, docs, upstream source).
+        #[arg(long)]
+        web: bool,
         /// Named panel from config. Ignored when --with is given.
         #[arg(short, long)]
         panel: Option<String>,
@@ -92,6 +100,8 @@ async fn main() -> Result<()> {
             with,
             chair,
             max_tokens,
+            code,
+            web,
             panel,
             rounds,
             transcript,
@@ -103,6 +113,8 @@ async fn main() -> Result<()> {
                 with,
                 chair,
                 max_tokens,
+                code,
+                web,
                 panel,
                 rounds,
                 transcript,
@@ -147,6 +159,8 @@ struct AskOpts {
     with: Vec<String>,
     chair: Option<String>,
     max_tokens: Option<u32>,
+    code: Vec<PathBuf>,
+    web: bool,
     panel: Option<String>,
     rounds: u8,
     transcript: bool,
@@ -172,6 +186,20 @@ async fn ask(config: Option<&std::path::Path>, o: AskOpts) -> Result<()> {
         other => other.map(str::to_owned),
     };
 
+    let tools = council_tools(&o.code, o.web)?;
+    if !tools.is_empty() {
+        eprintln!(
+            "council: tools enabled — roots: [{}], web: {}",
+            tools
+                .roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            tools.web
+        );
+    }
+
     let roster: Vec<String> = panel
         .members
         .iter()
@@ -190,6 +218,7 @@ async fn ask(config: Option<&std::path::Path>, o: AskOpts) -> Result<()> {
         rounds: o.rounds.clamp(1, 6),
         panel,
         max_tokens: o.max_tokens,
+        tools,
         resume: !o.fresh,
     }
     .run(&cfg)
@@ -207,6 +236,25 @@ async fn ask(config: Option<&std::path::Path>, o: AskOpts) -> Result<()> {
     }
     eprintln!("\nartifacts: {}", out.cache_dir.display());
     Ok(())
+}
+
+/// Build a toolbox, failing fast on a root that does not exist.
+fn council_tools(code: &[PathBuf], web: bool) -> Result<tools::Toolbox> {
+    let mut roots = Vec::with_capacity(code.len());
+    for dir in code {
+        let real = dir
+            .canonicalize()
+            .with_context(|| format!("--code {}: not found", dir.display()))?;
+        if !real.is_dir() {
+            anyhow::bail!("--code {}: not a directory", dir.display());
+        }
+        roots.push(real);
+    }
+    Ok(tools::Toolbox {
+        roots,
+        web,
+        max_bytes: tools::Toolbox::DEFAULT_MAX_BYTES,
+    })
 }
 
 fn models(config: Option<&std::path::Path>) -> Result<()> {

@@ -9,6 +9,7 @@ cargo build
 python3.11+ verify/openai_path.py        # 32 checks
 python3.11+ verify/anthropic_path.py     # 19 checks
 python3.11+ verify/runtime_selection.py  # 33 checks
+python3.11+ verify/research_tools.py     # 27 checks
 ```
 
 Override the binary with `COUNCIL_BIN=/path/to/council`.
@@ -30,3 +31,8 @@ selection, aliases, the `provider:model` escape hatch, validation failures
 before any API call, and the same knobs over MCP.
 
 Requires Python 3.11+ (`tomllib`).
+
+`research_tools.py` drives a fake provider that *requests tools*, so the
+agentic loop is exercised end to end: both wire formats, fragmented tool
+arguments, sandbox escape attempts, tool errors, loop bounding, and the
+research audit trail.

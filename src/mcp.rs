@@ -33,6 +33,14 @@ pub struct DeliberateArgs {
     /// Per-member token ceiling for this run.
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Absolute directories the panellists may READ and SEARCH so they can
+    /// answer their own questions from the code instead of speculating.
+    /// Read-only; no writes, no shell. Omit for text-only reasoning.
+    #[serde(default)]
+    pub code: Option<Vec<String>>,
+    /// Allow panellists to HTTP GET specs, docs or upstream source.
+    #[serde(default)]
+    pub web: Option<bool>,
     /// Rounds of debate. 1 = independent opinions only (no cross-talk),
     /// 3 = opening/cross-examination/commitment (recommended), 4+ for hard calls.
     #[serde(default)]
@@ -97,12 +105,34 @@ for factual lookups or tasks with a single correct answer."
         }
         .map_err(|e| ErrorData::invalid_params(format!("{e:#}"), None))?;
 
+        // Roots are resolved and checked here so a bad path is an invalid-params
+        // error rather than a confusing mid-run tool failure.
+        let mut roots = Vec::new();
+        for dir in args.code.unwrap_or_default() {
+            let real = std::path::Path::new(&dir)
+                .canonicalize()
+                .map_err(|e| ErrorData::invalid_params(format!("code path '{dir}': {e}"), None))?;
+            if !real.is_dir() {
+                return Err(ErrorData::invalid_params(
+                    format!("code path '{dir}' is not a directory"),
+                    None,
+                ));
+            }
+            roots.push(real);
+        }
+        let tools = crate::tools::Toolbox {
+            roots,
+            web: args.web.unwrap_or(false),
+            max_bytes: crate::tools::Toolbox::DEFAULT_MAX_BYTES,
+        };
+
         let d = Deliberation {
             question: args.question,
             context: args.context,
             rounds,
             panel,
             max_tokens: args.max_tokens,
+            tools,
             resume: true,
         };
         let out = d
