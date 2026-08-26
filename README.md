@@ -223,8 +223,8 @@ simultaneously produce exactly one upstream hit.
   or untrusted URL content**, and partial validation that reads like a security
   boundary would be worse than none.
 
-Every lookup is recorded in the transcript, so you can audit what a claim was
-actually based on:
+Every lookup is recorded in the transcript, so you can see what a claim was
+based on:
 
 ```
 <research>
@@ -241,6 +241,39 @@ them, and to cite `file:line`. Cross-examination gains an explicit
 
 The **chair gets no tools** — it synthesises what was argued, and must not
 introduce evidence nobody debated.
+
+#### Auditing a past run
+
+The transcript's `<research>` block proves a lookup *happened*, but not what it
+returned — so it cannot tell you whether a cited line actually supported the
+claim. Full provenance is persisted beside the prose as
+`r<round>_<member>.research.json`, and `council audit` reads it back:
+
+```bash
+council audit 47513f5c5431b77d           # every lookup, previewed
+council audit <run> --full               # whole results, nothing elided
+council audit <run> --failed             # only lookups that errored or found nothing
+```
+
+```
+=== round 1 | haiku (work-gateway:claude-haiku-4-5) | 9 lookups
+  [1] FAILED search_code(pattern=def fetch_url)
+      (no results)
+  [4] read_file(limit=100, offset=413, path=src/tools.rs)
+      413|            "fetch_url" => self.fetch_url(http, args).await,
+      ... 97 more lines (--full to see)
+
+13 lookups, 2 failed or empty
+```
+
+Each record keeps the step, tool, exact arguments, the **full** result, and
+whether it failed — plus the system prompt the member ran under, so a protocol
+change is visible in the record rather than inferred. That last part matters for
+comparing runs: a claim like "debate reduces unsupported assertions" cannot be
+checked against runs whose tool results were never written down.
+
+Accepts a run id or a directory path. Runs made before provenance existed report
+that plainly instead of erroring.
 
 The tool loop is bounded at 12 rounds per panellist. If a member burns its
 budget and then fails to produce a summary, its findings are still reported
@@ -423,7 +456,7 @@ If you extend this crate, keep the lints on. They pay for themselves.
 
 ## Verification
 
-9 unit tests plus 152 ad-hoc checks across five harnesses, run against fake in-process SSE servers
+13 unit tests plus 179 ad-hoc checks across six harnesses, run against fake in-process SSE servers
 (no tokens spent):
 
 - **OpenAI path (32):** full 3-round × 3-member run, request accounting, round-1
@@ -433,6 +466,10 @@ If you extend this crate, keep the lints on. They pay for themselves.
 - **Anthropic path (19):** wire shape, custom auth headers, `${ENV}` expansion,
   `thinking_delta` exclusion, the zero-text failure mode, truncation detection,
   partial-panel degradation.
+- **Provenance & audit (27):** a `.research.json` per member, full results
+  retained rather than summary lines, arguments verbatim, failed lookups flagged
+  and counted, the `audit` subcommand's output and flags, and graceful handling
+  of runs that predate provenance.
 - **Research tools (27):** tools off by default, `--code`/`--web` gating, the
   agentic loop on both wire formats (including fragmented tool arguments),
   sandbox escapes refused (absolute paths, `..`, nested traversal), tool errors

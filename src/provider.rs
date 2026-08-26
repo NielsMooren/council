@@ -181,29 +181,35 @@ impl Provider {
     ///
     /// With a non-empty toolbox this is an agentic loop: the model asks for a
     /// file or a search, we run it, append the result, and ask again.
-    pub async fn complete(&self, http: &reqwest::Client, r: Request<'_>) -> Result<String> {
+    pub async fn complete(&self, http: &reqwest::Client, r: Request<'_>) -> Result<Completion> {
         const MAX_TOOL_ROUNDS: usize = 12;
 
         let mut msgs = vec![json!({"role": "user", "content": r.user})];
-        // Kept so the transcript shows what each panellist actually checked -
-        // that audit trail is the whole point of giving them tools.
-        let mut findings: Vec<String> = Vec::new();
+        // Full records, not summary lines: a first line proves a lookup happened
+        // but not what it returned, which makes retrospective audit impossible.
+        let mut research: Vec<ToolRecord> = Vec::new();
 
-        for _ in 0..MAX_TOOL_ROUNDS {
+        for step in 1..=MAX_TOOL_ROUNDS {
             let turn = self.one_turn(http, &r, &msgs).await?;
             if turn.calls.is_empty() {
                 let text = Self::check(&turn.text, turn.stop.as_deref())?;
-                return Ok(with_research(text, &findings));
+                return Ok(Completion {
+                    text: with_research(text, &research),
+                    research,
+                });
             }
             msgs.push(self.assistant_turn(&turn));
             for call in &turn.calls {
                 let out = r.tools.call(http, &call.name, &call.args).await;
-                findings.push(format!(
-                    "- {}({}) -> {}",
-                    call.name,
-                    compact(&call.args),
-                    first_line(&out)
-                ));
+                research.push(ToolRecord {
+                    step,
+                    tool: call.name.clone(),
+                    args: call.args.clone(),
+                    // A tool reports its own errors as text rather than failing
+                    // the round, so detect them here to keep them countable.
+                    failed: out.starts_with("error:") || out == "(no results)",
+                    result: out.clone(),
+                });
                 msgs.push(self.tool_result(call, &out));
             }
         }
@@ -219,15 +225,21 @@ impl Provider {
         // final message - the findings are the expensive part. Fall back to
         // reporting them rather than failing the member out of the round.
         match Self::check(&turn.text, turn.stop.as_deref()) {
-            Ok(text) => Ok(with_research(text, &findings)),
-            Err(e) if findings.is_empty() => Err(e),
-            Err(e) => Ok(with_research(
-                format!(
+            Ok(text) => Ok(Completion {
+                text: with_research(text, &research),
+                research,
+            }),
+            Err(e) if research.is_empty() => Err(e),
+            Err(e) => {
+                let note = format!(
                     "(No summary produced: {e}. Research findings below are all this member \
                      established; weigh them accordingly.)"
-                ),
-                &findings,
-            )),
+                );
+                Ok(Completion {
+                    text: with_research(note, &research),
+                    research,
+                })
+            }
         }
     }
 
@@ -501,6 +513,30 @@ impl Acc {
     }
 }
 
+/// One tool invocation, recorded in full.
+///
+/// The whole point: a `<research>` summary line proves a lookup happened but not
+/// what it returned, so a past deliberation cannot be audited - you cannot check
+/// whether a cited line actually supported the claim. This carries the argument
+/// AND the result, so the record is verifiable after the fact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolRecord {
+    /// Which round of the tool loop, 1-based.
+    pub step: usize,
+    pub tool: String,
+    pub args: Value,
+    /// Full result handed back to the model, not a first line.
+    pub result: String,
+    /// Whether the tool reported an error, so failed lookups stay visible.
+    pub failed: bool,
+}
+
+/// A finished panellist turn: the prose, plus every lookup behind it.
+pub struct Completion {
+    pub text: String,
+    pub research: Vec<ToolRecord>,
+}
+
 /// One model turn: prose, why it stopped, and any tools it wants run.
 pub struct Turn {
     pub text: String,
@@ -509,11 +545,22 @@ pub struct Turn {
 }
 
 /// Attach the research trail so the transcript records what was actually checked.
-fn with_research(text: String, findings: &[String]) -> String {
-    if findings.is_empty() {
+fn with_research(text: String, research: &[ToolRecord]) -> String {
+    if research.is_empty() {
         return text;
     }
-    format!("{text}\n\n<research>\n{}\n</research>", findings.join("\n"))
+    let lines: Vec<String> = research
+        .iter()
+        .map(|rec| {
+            format!(
+                "- {}({}) -> {}",
+                rec.tool,
+                compact(&rec.args),
+                first_line(&rec.result)
+            )
+        })
+        .collect();
+    format!("{text}\n\n<research>\n{}\n</research>", lines.join("\n"))
 }
 
 /// Render tool args compactly for the research trail.

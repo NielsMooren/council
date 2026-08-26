@@ -86,6 +86,21 @@ enum Cmd {
     Models,
     /// Verify config parses and every referenced provider has a key.
     Check,
+    /// Audit a past deliberation: what each panellist looked up, what it got
+    /// back, and which lookups failed.
+    ///
+    /// The transcript keeps one summary line per lookup; the full results are
+    /// persisted beside it, which is what makes a past run checkable at all.
+    Audit {
+        /// Run directory, or a run id under `<data_dir>/runs/`.
+        run: String,
+        /// Show every lookup's full result, not just the first lines.
+        #[arg(long)]
+        full: bool,
+        /// Only show lookups that errored or returned nothing.
+        #[arg(long)]
+        failed: bool,
+    },
 }
 
 #[tokio::main]
@@ -141,6 +156,9 @@ async fn main() -> Result<()> {
         Cmd::Panels => panels(cli.config.as_deref())?,
         Cmd::Models => models(cli.config.as_deref())?,
         Cmd::Check => check(cli.config.as_deref())?,
+        Cmd::Audit { run, full, failed } => {
+            audit(cli.config.as_deref(), &run, full, failed)?;
+        }
     }
     Ok(())
 }
@@ -292,6 +310,130 @@ fn council_tools(
         rate: tools::RateLimit::new(std::time::Duration::from_millis(host_delay_ms), host_budget),
         cache: tools::UrlCache::new(std::time::Duration::from_secs(cache_ttl)),
     })
+}
+
+#[derive(serde::Deserialize)]
+struct ToolRecord {
+    step: usize,
+    tool: String,
+    args: serde_json::Value,
+    result: String,
+    failed: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct ResearchLog {
+    round: u8,
+    member: String,
+    provider: String,
+    model: String,
+    research: Vec<ToolRecord>,
+}
+
+/// Replay the research behind a past deliberation.
+fn audit(config: Option<&std::path::Path>, run: &str, full: bool, only_failed: bool) -> Result<()> {
+    let dir = resolve_run_dir(config, run)?;
+    let mut logs: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".research.json"))
+        })
+        .collect();
+    logs.sort();
+
+    if logs.is_empty() {
+        println!("no provenance in {}", dir.display());
+        println!(
+            "(runs made before tool provenance was added keep only the one-line \
+             <research> summaries inside r*_<member>.md)"
+        );
+        return Ok(());
+    }
+
+    println!("run: {}\n", dir.display());
+    let (mut calls, mut failed_calls) = (0_usize, 0_usize);
+    for path in logs {
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let log: ResearchLog =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        println!(
+            "=== round {} | {} ({}:{}) | {} lookups",
+            log.round,
+            log.member,
+            log.provider,
+            log.model,
+            log.research.len()
+        );
+        for rec in &log.research {
+            calls = calls.saturating_add(1);
+            if rec.failed {
+                failed_calls = failed_calls.saturating_add(1);
+            }
+            if only_failed && !rec.failed {
+                continue;
+            }
+            let mark = if rec.failed { "FAILED " } else { "" };
+            println!(
+                "  [{}] {mark}{}({})",
+                rec.step,
+                rec.tool,
+                compact_args(&rec.args)
+            );
+            if full {
+                for line in rec.result.lines() {
+                    println!("      {line}");
+                }
+            } else {
+                for line in rec.result.lines().take(3) {
+                    println!("      {line}");
+                }
+                let extra = rec.result.lines().count().saturating_sub(3);
+                if extra > 0 {
+                    println!("      ... {extra} more lines (--full to see)");
+                }
+            }
+        }
+        println!();
+    }
+    println!("{calls} lookups, {failed_calls} failed or empty");
+    Ok(())
+}
+
+/// Accept a run id or a path, so both `council audit <id>` and a tab-completed
+/// directory work.
+fn resolve_run_dir(config: Option<&std::path::Path>, run: &str) -> Result<PathBuf> {
+    let direct = PathBuf::from(run);
+    if direct.is_dir() {
+        return Ok(direct);
+    }
+    let cfg = Config::load(config)?;
+    let candidate = cfg.data_dir().join("runs").join(run);
+    if candidate.is_dir() {
+        return Ok(candidate);
+    }
+    anyhow::bail!(
+        "no such run: '{run}' (looked in {})",
+        cfg.data_dir().join("runs").display()
+    )
+}
+
+fn compact_args(args: &serde_json::Value) -> String {
+    args.as_object().map_or_else(
+        || args.to_string(),
+        |m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let val = v.as_str().map_or_else(|| v.to_string(), str::to_owned);
+                    format!("{k}={}", val.chars().take(60).collect::<String>())
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    )
 }
 
 fn models(config: Option<&std::path::Path>) -> Result<()> {

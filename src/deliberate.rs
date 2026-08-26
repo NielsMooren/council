@@ -34,6 +34,21 @@ pub struct Deliberation {
     pub resume: bool,
 }
 
+/// Everything needed to audit one panellist's turn after the fact: what it was
+/// asked, what it looked up, what each lookup returned, and what it concluded.
+#[derive(serde::Serialize)]
+struct ResearchLog {
+    round: u8,
+    member: String,
+    provider: String,
+    model: String,
+    /// The exact system prompt, so a protocol change is visible in the record.
+    system: String,
+    prompt: String,
+    answer: String,
+    research: Vec<crate::provider::ToolRecord>,
+}
+
 pub struct Outcome {
     pub transcript: String,
     pub consensus: String,
@@ -281,7 +296,8 @@ impl Deliberation {
                         },
                     )
                     .await
-                    .context("chair synthesis failed")?;
+                    .context("chair synthesis failed")?
+                    .text;
                 let _ = tokio::fs::write(&consensus_path, &text).await;
                 text
             }
@@ -349,10 +365,34 @@ impl Deliberation {
                         },
                     )
                     .await;
-                if let Ok(text) = &out {
-                    let _ = tokio::fs::write(&path, text).await;
+                match out {
+                    Ok(done) => {
+                        let _ = tokio::fs::write(&path, &done.text).await;
+                        // Full provenance beside the prose. The transcript keeps
+                        // one summary line per lookup; this keeps the arguments
+                        // AND the results, which is what makes a past
+                        // deliberation auditable at all.
+                        if !done.research.is_empty() {
+                            let meta = ResearchLog {
+                                round,
+                                member: member.name.clone(),
+                                provider: member.provider.clone(),
+                                model: member.model.clone(),
+                                system: system.clone(),
+                                prompt: prompt.to_string(),
+                                answer: done.text.clone(),
+                                research: done.research,
+                            };
+                            if let Ok(json) = serde_json::to_vec_pretty(&meta) {
+                                let jpath =
+                                    dir.join(format!("r{round}_{}.research.json", member.name));
+                                let _ = tokio::fs::write(jpath, json).await;
+                            }
+                        }
+                        (member.name, Ok(done.text))
+                    }
+                    Err(e) => (member.name, Err(e)),
                 }
-                (member.name, out)
             });
         }
 
