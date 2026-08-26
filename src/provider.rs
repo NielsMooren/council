@@ -219,6 +219,9 @@ impl Provider {
                     // the round, so detect them here to keep them countable.
                     failed: out.starts_with("error:") || out == "(no results)",
                     result: out.clone(),
+                    // Drained per call, so each record carries exactly the hops
+                    // its own call produced.
+                    fetched: r.tools.egress.drain().await,
                 });
                 msgs.push(self.tool_result(call, &out));
             }
@@ -548,6 +551,13 @@ pub struct ToolRecord {
     pub result: String,
     /// Whether the tool reported an error, so failed lookups stay visible.
     pub failed: bool,
+    /// Every URL actually contacted by this call, in order, including redirect
+    /// hops the model never named.
+    ///
+    /// Without this, a redirect to `?dump=<secret>` executed and left no trace,
+    /// because only the model's original argument was recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fetched: Vec<String>,
 }
 
 /// A finished panellist turn: the prose, plus every lookup behind it.

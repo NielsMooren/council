@@ -99,6 +99,28 @@ async fn write_log(
         .with_context(|| format!("writing {}", path.display()))
 }
 
+/// Persist whatever a failed member managed to look up before it died.
+///
+/// That partial trail is exactly what an audit needs, and a write failure here
+/// is reported rather than swallowed: the original error is preserved in the
+/// `failed` field and returned by the caller regardless, so warning masks
+/// nothing.
+async fn persist_salvage(ctx: &LogCtx, e: &anyhow::Error) {
+    let Some(research) = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::provider::Salvaged>())
+        .map(|s| s.0.clone())
+    else {
+        return;
+    };
+    if let Err(werr) = write_log(ctx, research, String::new(), Some(format!("{e:#}"))).await {
+        eprintln!(
+            "council: WARNING could not persist salvaged provenance for {} round {}: {werr:#}",
+            ctx.name, ctx.round
+        );
+    }
+}
+
 /// Root paths for the cache manifest.
 ///
 /// Paths, not contents: hashing a whole tree per run is too slow to be worth it.
@@ -536,17 +558,7 @@ impl Deliberation {
                         (member.name, Ok(done.text))
                     }
                     Err(e) => {
-                        // Salvage whatever the member managed to look up before
-                        // it died, so the failed run is still auditable.
-                        let rescued = e
-                            .chain()
-                            .find_map(|c| c.downcast_ref::<crate::provider::Salvaged>())
-                            .map(|s| s.0.clone());
-                        if let Some(research) = rescued {
-                            let _ =
-                                write_log(&ctx, research, String::new(), Some(format!("{e:#}")))
-                                    .await;
-                        }
+                        persist_salvage(&ctx, &e).await;
                         (member.name, Err(e))
                     }
                 }

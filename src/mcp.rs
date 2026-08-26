@@ -130,6 +130,7 @@ for factual lookups or tasks with a single correct answer."
             // 10-minute TTL: long enough that a multi-round deliberation reads a
             // page once, short enough that a live doc is not stale by the end.
             cache: crate::tools::UrlCache::default(),
+            egress: crate::tools::EgressLog::default(),
         };
 
         let d = Deliberation {

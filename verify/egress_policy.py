@@ -201,6 +201,37 @@ check("only the redirect itself was fetched", len(HITS) == 1, HITS)
 joined = "\n".join(TOOL_OUT)
 check("refusal mentions the redirect", "redirect" in joined.lower(), joined[:250])
 
+print("\n5c. every hop is RECORDED in provenance, not just the model's URL")
+# The justification for permitting query strings is that fetches are auditable.
+# A redirect hop the model never named must therefore appear in the record.
+r = run(f"http://127.0.0.1:{lport}/redirect-with-query", "Q-hop-logged")
+rundir = sorted((tmp / "data" / "runs").iterdir(), key=lambda q: q.stat().st_mtime)[-1]
+logs = sorted(rundir.glob("*.research.json"))
+fetched, asked = [], []
+for lp in logs:
+    for rec in json.loads(lp.read_text()).get("research", []):
+        asked.append(rec["args"].get("url"))
+        fetched.extend(rec.get("fetched", []))
+check("provenance was written", bool(logs), logs)
+check("the model's own URL is recorded",
+      any("redirect-with-query" in (u or "") for u in asked), asked)
+check("the REDIRECT HOP is recorded (was invisible before)",
+      any("stolen=SECRET" in u for u in fetched), fetched)
+# One member fetches for real, the other gets a cache hit and so records no
+# hops - the ordering guarantee applies to the member that actually fetched.
+first_hop = next((f for f in fetched if "redirect-with-query" in f), None)
+check("the requested URL precedes its hop",
+      first_hop is not None and fetched.index(first_hop) < next(
+          i for i, u in enumerate(fetched) if "stolen=SECRET" in u),
+      fetched)
+
+print("\n5d. council audit surfaces the hop to a human")
+a = subprocess.run([BIN, "-c", str(cfg), "audit", rundir.name],
+                   capture_output=True, text=True, env=env, timeout=120)
+check("audit succeeds", a.returncode == 0, a.stderr[-200:])
+check("audit prints the hop", "hop 2:" in a.stdout and "stolen=SECRET" in a.stdout,
+      a.stdout[:400])
+
 print("\n6. a plain redirect still works")
 r = run(f"http://127.0.0.1:{lport}/redirect-plain", "Q-redirect-ok")
 check("plain redirect followed to the target", len(HITS) == 2, HITS)

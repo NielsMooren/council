@@ -309,6 +309,7 @@ fn council_tools(
         max_bytes: tools::Toolbox::DEFAULT_MAX_BYTES,
         rate: tools::RateLimit::new(std::time::Duration::from_millis(host_delay_ms), host_budget),
         cache: tools::UrlCache::new(std::time::Duration::from_secs(cache_ttl)),
+        egress: tools::EgressLog::default(),
     })
 }
 
@@ -319,6 +320,8 @@ struct ToolRecord {
     args: serde_json::Value,
     result: String,
     failed: bool,
+    #[serde(default)]
+    fetched: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -383,6 +386,15 @@ fn audit(config: Option<&std::path::Path>, run: &str, full: bool, only_failed: b
                 rec.tool,
                 compact_args(&rec.args)
             );
+            // Hops the model never named. A redirect chain is exactly what a
+            // plain args listing hides, and it is where an exfiltrating request
+            // would live.
+            let asked = rec.args.get("url").and_then(serde_json::Value::as_str);
+            for (i, u) in rec.fetched.iter().enumerate() {
+                if Some(u.as_str()) != asked {
+                    println!("      -> hop {}: {u}", i.saturating_add(1));
+                }
+            }
             if full {
                 for line in rec.result.lines() {
                     println!("      {line}");

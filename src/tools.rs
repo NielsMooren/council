@@ -324,6 +324,36 @@ pub struct Toolbox {
     pub rate: RateLimit,
     /// Fetched pages, shared by every panellist in the run.
     pub cache: UrlCache,
+    /// Every URL actually contacted, including redirect hops.
+    ///
+    /// The model only ever names the FIRST url; hops are chosen by the remote
+    /// server. Recording only `call.args` meant a redirect to
+    /// `?dump=<secret>` executed and left no trace - which falsified the stated
+    /// justification for permitting query strings at all.
+    pub egress: EgressLog,
+}
+
+/// Records every URL actually contacted, so the audit trail covers hops the
+/// model never named.
+#[derive(Debug, Clone, Default)]
+pub struct EgressLog {
+    urls: Arc<Mutex<Vec<String>>>,
+}
+
+impl EgressLog {
+    /// Note a URL immediately BEFORE the request goes out, so an attempt is
+    /// recorded even if the request then fails or hangs.
+    async fn record(&self, url: &Url) {
+        self.urls.lock().await.push(url.as_str().to_owned());
+    }
+
+    /// Take everything recorded since the last drain.
+    ///
+    /// Drained per tool call so each `ToolRecord` carries exactly the hops that
+    /// its own call produced.
+    pub async fn drain(&self) -> Vec<String> {
+        std::mem::take(&mut *self.urls.lock().await)
+    }
 }
 
 impl Toolbox {
@@ -639,6 +669,9 @@ impl Toolbox {
         const MAX_HOPS: usize = 10;
 
         for hop in 0..=MAX_HOPS {
+            // Record BEFORE the request, not after: an attempt that times out or
+            // is refused still tells you what was reached for.
+            self.egress.record(&url).await;
             // Charge the origin we are ABOUT to contact, on every hop.
             self.rate.acquire(&origin_of(&url)).await?;
             let resp = http
@@ -699,10 +732,12 @@ impl Toolbox {
 ///   is a write disguised as a read), but they are also how a large share of
 ///   useful endpoints work, so blocking them broke more than it protected. The
 ///   accepted position: council can exfiltrate via a GET query exactly like
-///   `curl` can, and the mitigation is that every fetch is recorded in the run's
-///   provenance with its full URL - an attempt is *auditable after the fact*
-///   rather than prevented. Do not expose `fetch_url` to untrusted callers or
-///   untrusted URL content on that basis.
+///   `curl` can. Every URL actually contacted - including redirect hops the
+///   model never named - is recorded in the run's provenance as `fetched`, so an
+///   attempt is *forensically visible after the fact*. That is telemetry, NOT a
+///   control: the same process does the fetching and the logging, so a
+///   compromised run could in principle write whatever it likes. Do not expose
+///   `fetch_url` to untrusted callers or untrusted URL content.
 ///
 /// What remains blocked has no legitimate server-side use:
 fn check_no_data_egress(url: &Url) -> Result<()> {

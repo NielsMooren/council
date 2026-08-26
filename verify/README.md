@@ -13,7 +13,7 @@ python3.11+ verify/runtime_selection.py  # 33 checks
 python3.11+ verify/research_tools.py     # 27 checks
 python3.11+ verify/web_politeness.py     # 41 checks
 python3.11+ verify/provenance.py         # 27 checks
-python3.11+ verify/egress_policy.py      # 18 checks
+python3.11+ verify/egress_policy.py      # 24 checks
 ```
 
 Override the binary with `COUNCIL_BIN=/path/to/council`.

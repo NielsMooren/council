@@ -225,10 +225,19 @@ no privilege its parent did not already have.
 **Query strings are permitted.** They are a genuine exfiltration channel
 (`?dump=<secret>` is a write disguised as a read), and blocking them was tried
 and reverted: too many real endpoints need them. The accepted position is that
-council can exfiltrate via a GET query exactly like `curl` can, and the
-mitigation is **provenance, not prevention** — every fetch is recorded in the
-run's `.research.json` with its full URL, so an attempt is auditable after the
-fact. Read the audit trail if you care what was fetched.
+council can exfiltrate via a GET query exactly like `curl` can.
+
+Every URL actually contacted — **including redirect hops the model never
+named** — is recorded per tool call as `fetched`, and `council audit` prints
+each hop. That distinction matters: a panel found that recording only the
+model's own argument left a redirect to `?dump=<secret>` completely invisible,
+which falsified the original justification for allowing query strings at all.
+
+This is **forensics, not a control.** The same process does the fetching and
+the writing, so a compromised run could in principle log whatever it likes.
+Trustworthy audit would need an append-only sink outside the process; hash
+chaining written by the same process buys nothing. Treat the trail as telemetry
+you can read after the fact, and nothing stronger.
 
 Refused, because none has a legitimate server-side use:
 
@@ -538,7 +547,7 @@ If you extend this crate, keep the lints on. They pay for themselves.
 
 ## Verification
 
-20 unit tests plus 197 ad-hoc checks across seven harnesses, run against fake in-process SSE servers
+20 unit tests plus 203 ad-hoc checks across seven harnesses, run against fake in-process SSE servers
 (no tokens spent):
 
 - **OpenAI path (32):** full 3-round × 3-member run, request accounting, round-1
@@ -548,10 +557,11 @@ If you extend this crate, keep the lints on. They pay for themselves.
 - **Anthropic path (19):** wire shape, custom auth headers, `${ENV}` expansion,
   `thinking_delta` exclusion, the zero-text failure mode, truncation detection,
   partial-panel degradation.
-- **URL policy (18):** local/private addresses reachable, query strings
-  permitted and preserved verbatim, fragments and credentials and non-http
-  schemes refused before any socket opens, and a redirect to a blocked shape
-  refused at the hop while plain and query-bearing redirects still resolve.
+- **URL policy & egress log (24):** local/private addresses reachable, query
+  strings permitted and preserved verbatim, fragments and credentials and
+  non-http schemes refused before any socket opens, a redirect to a blocked
+  shape refused at the hop, and — the finding that mattered — every redirect
+  hop recorded in provenance and surfaced by `council audit`.
 - **Provenance & audit (27):** a `.research.json` per member, full results
   retained rather than summary lines, arguments verbatim, failed lookups flagged
   and counted, the `audit` subcommand's output and flags, and graceful handling
